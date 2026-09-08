@@ -32,6 +32,7 @@ lb = [0, 0, 0]
 ub = [1, 1, 2*np.pi]
 popt, pcov = curve_fit(model, alp, P_exp, p0=p0, bounds=(lb, ub))
 A, B, ph = popt
+print(f"A = {A}, B = {B}, ph = {ph}")
 sigma_A, sigma_B, sigma_ph = np.sqrt(np.diag(pcov))
 print(f"sigma avg A = {sigma_A}, sigma avg B = {sigma_B}, sigma avg ph = {sigma_ph}")
 
