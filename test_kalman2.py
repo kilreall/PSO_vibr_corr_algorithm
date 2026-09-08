@@ -111,13 +111,14 @@ sum1kp, sum2kp, normkp, scankp = np.loadtxt(kp, delimiter=',', skiprows=1, unpac
 # scankp = np.mean(scankp, axis=0)
 # normkp = np.mean(normkp, axis=0)
 
-plt.plot(scankp, normkp, label="exp")
+plt.plot(normkp, label="exp")
 
 # kalman fit
 alp = scankp
 P_exp = normkp
 P_m, A, B, ph = kalmanFit2(alp, P_exp)
-plt.plot(alp, model(alp, A, B, ph), label="kalman")
+plt.plot(model(alp, A, B, ph), label="kalman")
+plt.plot(model(alp, A[0], B[0], ph[0]), label="sin")
 plt.legend()
 
 #plt.figure()
