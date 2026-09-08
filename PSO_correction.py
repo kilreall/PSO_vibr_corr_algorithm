@@ -4,8 +4,10 @@ from scipy.integrate import simpson
 from scipy.optimize import curve_fit
 
 def sinf(alpha, A, B, ph):
-    return A + B*np.cos(-2*np.pi*alpha*T**2 + ph)
+    return A + B*np.cos(2*np.pi*alpha*T**2 - ph)
 
+def model(alp, A, B, ph):
+    return A + B*np.cos(2*np.pi*alp*T**2 - ph)
 
 # accelerometer sensetivity function
 def fa(t):
@@ -18,9 +20,123 @@ def fa(t):
 vfunc = np.vectorize(fa)
 
 
+def kalmanFit1(alp, P_exp, n_A, n_B, n_ph): # K guess alghorythm
 
-def kalman_fit():
+    # param init
+    A = np.zeros(len(alp))
+    B = np.zeros(len(alp))
+    ph = np.zeros(len(alp))
+    e = np.zeros(len(alp))
+
+    # init coef
+    poi = 201
+    p0 = [(np.max(P_exp)+np.min(P_exp))/2, (np.max(P_exp)-np.min(P_exp))/2, 0]
+    lb = [0, 0, 0]
+    ub = [1, 1, 2*np.pi]
+    popt, pcov = curve_fit(model, alp[:poi], P_exp[:poi], p0=p0, bounds=(lb, ub))
+    A[0], B[0], ph[0] = popt
+
+
+    for i in range(1, len(alp)):
+
+        e[i] = P_exp[i] - model(alp[i], A[i-1], B[i-1])
+
+        Ph_i = 2*np.pi*alp[i]*T**2 - ph[i-1]
+        D_i = 1 + np.cos(Ph_i)**2 + B[i-1]**2*np.sin(Ph_i)**2
+
+        A[i] = A[i-1] + n_A*e[i]/D_i
+        B[i] = B[i-1] + n_B*np.cos(Ph_i)*e[i]/D_i
+        ph[i] = ph[i-1] + n_ph*B[i-1]*np.sin(Ph_i)*e[i]/D_i
+
+
+
     return 1
+
+def kalmanFit2(alp, P_exp): # nonlinear/unscented kalman filter
+
+    # param init
+    A = np.zeros(len(alp))
+    B = np.zeros(len(alp))
+    ph = np.zeros(len(alp))
+    e = np.zeros(len(alp))
+    P_m = np.zeros(len(alp))
+
+    # matrix init
+    P_cov = np.diag([0.01**2, 0.01**2, 0.01**2])
+
+    Q = np.zeros((3,3))
+
+    R = 1e-4
+
+    # sgima points
+    n = 3
+    alp_ukf = 1e-3
+    Beta = 2
+    kappa = 0
+    lambd = alp_ukf**2*(kappa + n) - n
+    prop = np.sqrt(n+lambd)
+
+    for i in range(1, len(alp)):
+
+        # cholskiy разложение P = L*L^T L = chol(P)
+        L = np.linalg.cholesky(P_cov)
+        L = L.T
+
+        # определение точек около основной
+        hi = np.zeros((2*n+1,3))
+        hi[0]  = np.array([A[i-1], B[i-1], ph[i-1]])
+        for j in range(1, 4):
+            hi[j] = hi[0] + prop*L[j-1]
+            hi[j+n] = hi[0] - prop*L[j-1]
+        
+
+        y = np.zeros(2*n+1)
+        for j in range(2*n+1):
+            y[j] = model(alp[i], hi[j,0], hi[j,1], hi[j,2])
+
+        # определение предсказания экспериментального измерения
+        Wm = np.ones(2*n + 1) / (2*(n + lambd))
+        Wc = np.ones(2*n + 1) / (2*(n + lambd))
+
+        Wm[0] = lambd / (n + lambd)
+        Wc[0] = lambd / (n + lambd) + (1 - alp_ukf**2 + Beta)
+
+
+
+        for j in range(2*n+1):
+            P_m[i] += Wm[j]*y[j]
+
+        # measurement covariance/uncertinty
+        S_i = R
+        for j in range(2*n+1):
+            S_i += Wc[j]*(P_m[i] - y[j])**2
+
+        # cross covariance
+        C_i = np.zeros(3)
+        
+        for j in range(2*n+1):
+            C_i += Wc[j]*(hi[j]-hi[0])*(y[j] - P_m[i]) # тут hi[0]?
+        
+        # Kalman gain
+        K_i = C_i/S_i        
+        
+        e[i] = P_exp[i] - P_m[i]
+
+        A[i] = A[i-1] + K_i[0]*e[i]
+        B[i] = B[i-1] + K_i[1]*e[i]
+        ph[i] = ph[i-1] + K_i[2]*e[i]
+
+        P_cov = P_cov - S_i * np.outer(K_i, K_i)
+        P_cov = P_cov + Q
+
+    return P_m
+
+def kalmanFilter3(alp, P_exp): # jacobian kalman
+    return 1
+
+
+
+
 
 
 def rules(f_vib_, dP):
@@ -129,7 +245,7 @@ plt.plot(acc_mz[6])
 
 ###
 
-kz = 1
-StI = 0
-fitness(acc_mz, kz, StI)
+# kalman filter fitting
+
+
 plt.show()
