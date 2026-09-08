@@ -4,7 +4,7 @@ from scipy.integrate import simpson
 from scipy.optimize import curve_fit
 
 def sinf(alpha, A, B, ph):
-    return B*np.cos(-2*np.pi*alpha*T**2 + ph) + A
+    return A + B*np.cos(-2*np.pi*alpha*T**2 + ph)
 
 
 # accelerometer sensetivity function
@@ -17,50 +17,84 @@ def fa(t):
         return 0
 vfunc = np.vectorize(fa)
 
-def fitness(chirp_rate, intensity, acc_mz, kz, StI): # StI - time delay in index
 
+
+def kalman_fit():
+    return 1
+
+
+def rules(f_vib_, dP):
+    weight_1 = 0
+    weight_2 = 0
+
+    if abs(f_vib_) > 0.1: weight_1 = 1
+    if abs(f_vib_) > 1: weight_1 = 2
+    if abs(f_vib_) > 2: weight_1 = 3
+
+    if abs(dP) > 0.01: weight_2 = 1
+    if abs(dP) > 0.05: weight_2 = 2
+    if abs(dP) > 0.1: weight_2 = 3
+
+    K = np.zeros((7,7))
+    K[0] = [1, ]
+
+    return 1
+
+
+def fitness_fuzzy(alpha, P_exp, acc_mz, kz, st_i): # StI - time delay in index
+
+    # rules
+    k_A = 0.01
+    k_B = 1.1
+    k_alp = 1.1
+    k_others = 1.1
 
     # fit coef
-    A_m = np.zeros(len(chirp_rate))
-    B_m = np.zeros(len(chirp_rate))
-    Foth_m = np.zeros(len(chirp_rate))
-    P_eval_m = np.zeros(len(chirp_rate))
-    g_ph_m = np.zeros(len(chirp_rate))
+    A_m = np.zeros(len(alpha))
+    B_m = np.zeros(len(alpha))
+    F_oth_m = np.zeros(len(alpha))
+    P_eval_m = np.zeros(len(alpha))
 
     # initial coef
-    Foth_m[0] = 0
     poi = 201
-    p0 = [(np.max(intensity)-np.min(intensity))/2, (np.max(intensity)+np.min(intensity))/2, 0]
+    p0 = [(np.max(P_exp)+np.min(P_exp))/2, (np.max(P_exp)-np.min(P_exp))/2, 0]
     lb = [0, 0, 0]
     ub = [1, 1, 2*np.pi]
-    popt, pcov = curve_fit(sinf, chirp_rate[:poi], intensity[:poi], p0=p0, bound=(lb, ub))
-    A_m[0], B_m[0], g_ph_m[0] = popt
+    popt, pcov = curve_fit(sinf, alpha[:poi], P_exp[:poi], p0=p0, bound=(lb, ub))
+    A_m[0], B_m[0], F_oth_m[0] = popt
 
     # Fvib
-    intvib = acc_mz[:, StI:StI+iTAI+1]*fat
+    intvib = acc_mz[:, st_i:st_i+iTAI+1]*fat
     fvib = keff*simpson(y=intvib, x=tan, axis=-1)*kz
 
     # Fvib* [0, 2pi)
     fvib_ = fvib % (2*np.pi) # тут не уверен, возможно один период внутри косинуса имели ввиду
 
-    chirp_corr = chirp_rate - fvib_/T**2/(2*np.pi) # + or -, 2pi?
+    alpha_corr = alpha - fvib_/T**2/(2*np.pi) # + or -, 2pi? # тут можно сделать чтобы alpha corr попадала в тот же диапазон что и alpha
 
     # iteration process
     for i in range(len(chirp_rate)):
 
-        P_eval_m[i] = A_m[i] + B_m[i]*np.cos(g_ph_m[i] - 2*np.pi*chirp_corr[i]*T**2 + Foth_m[i])
-        dP = intensity - P_eval_m[i]
-        A_m[i+1] = dP/
+        P_eval_m[i] = A_m[i] + B_m[i]*np.cos(-2*np.pi*alpha_corr[i]*T**2 + F_oth_m[i])
+        dP = P_exp[i] - P_eval_m[i]
+
+        k_A, k_B, k_g, k_alp, k_others = rules(fvib_[i], dP)
+        A_m[i+1] = A_m[i] + k_A
+        B_m[i+1] = B_m[i] + k_B*np.cos(-2*np.pi*alpha_corr[i]*T**2 + F_oth_m[i])
+        alpha_corr[i+1] = alpha_corr[i+1] + k_alp*np.sin( - 2*np.pi*alpha_corr[i]*T**2 + F_oth_m[i]) * 2*np.pi*T*T
+        F_oth_m[i+1] = F_oth_m[i] - k_others*B_m[i]*np.sin( - 2*np.pi*alpha_corr[i]*T**2 + F_oth_m[i])
+
+    sigma = np.std(P_eval_m - P_exp)
 
 
-    return 1
-#
+    return sigma, alpha_corr, P_eval_m
+
+
 # constants
 lam = 780e-9
 keff = 4*np.pi/lam
 
 # QG Params
-
 T = 8200e-6
 ty = 20e-6
 TAI = 2*T+4*ty
