@@ -193,7 +193,7 @@ def kalmanFit_UKF(alp, P_exp):
 
         P_cov[i] = ukf.P
 
-    return P_m, A, B, ph, P_cov
+    return P_m, A, B, ph, P_cov, e
 
 plt.figure()
 
@@ -211,40 +211,52 @@ sum1kp, sum2kp, normkp, scankp = np.loadtxt(kp, delimiter=',', skiprows=1, unpac
 # normkp = normkp.reshape((cycleskp, poi))
 # scankp = np.mean(scankp, axis=0)
 # normkp = np.mean(normkp, axis=0)
-plt.plot(normkp, label="exp")
+
 
 # kalman fit
 alp = scankp
 P_exp = normkp
-P_m, A, B, ph, P_cov = kalmanFit_UKF(alp, P_exp)
-plt.plot(model(alp, A, B, ph), label="kalman")
-plt.plot(model(alp, A[0], B[0], ph[0]), label="sin")
-plt.legend()
+P_m, A, B, ph, P_cov, e = kalmanFit_UKF(alp, P_exp)
 
-# additional graphics
-fig, axs = plt.subplots(1, 3, figsize=(14, 4))
-axs[0].plot(A)
-axs[0].set_title('A')
 
-# Второй график (верхний правый)
-axs[1].plot(B)
-axs[1].set_title('B')
 
-# Третий график (нижний левый)
-axs[2].plot(ph)  # или axs[1, 0]
-axs[2].set_title(r'$\phi$')
+# # main graphic
+# plt.figure()
+# plt.plot(normkp, label="exp")
+# plt.plot(model(alp, A, B, ph), label="kalman")
+# plt.plot(model(alp, A[0], B[0], ph[0]), label="sin")
+# plt.legend()
 
-fig1, axss = plt.subplots(1, 3, figsize=(14, 4))
-axss[0].plot(P_cov[:, 0, 0])
-axss[0].set_title('dA')
 
-# Второй график (верхний правый)
-axss[1].plot(P_cov[:, 1, 1])
-axss[1].set_title('dB')
+# # additional graphics
+# fig, axs = plt.subplots(1, 3, figsize=(14, 4))
+# axs[0].plot(A)
+# axs[0].set_title('A')
 
-# Третий график (нижний левый)
-axss[2].plot(P_cov[:, 2, 2])  # или axs[1, 0]
-axss[2].set_title(r'$d\phi$')
+# # Второй график (верхний правый)
+# axs[1].plot(B)
+# axs[1].set_title('B')
+
+# # Третий график (нижний левый)
+# axs[2].plot(ph)  # или axs[1, 0]
+# axs[2].set_title(r'$\phi$')
+
+# fig1, axss = plt.subplots(1, 3, figsize=(14, 4))
+# axss[0].plot(np.sqrt(P_cov[:, 0, 0]))
+# axss[0].set_title('dA')
+
+# # Второй график (верхний правый)
+# axss[1].plot(np.sqrt(P_cov[:, 1, 1]))
+# axss[1].set_title('dB')
+
+# # Третий график (нижний левый)
+# axss[2].plot(np.sqrt(P_cov[:, 2, 2]))  # или axs[1, 0]
+# axss[2].set_title(r'$d\phi$')
+
+# Q finder
+plt.figure()
+plt.title("Q find params")
+plt.plot(e, label="innovation")
 
 
 plt.show()
