@@ -24,9 +24,9 @@ sum1kp, sum2kp, normkp, scankp = np.loadtxt(kp, delimiter=',', skiprows=1, unpac
 plt.plot(scankp, normkp, label="exp")
 
 # fit
-P_exp = normkp
-alp = scankp
 poi = 201
+P_exp = normkp[:poi]
+alp = scankp[:poi]
 p0 = [(np.max(P_exp)+np.min(P_exp))/2, (np.max(P_exp)-np.min(P_exp))/2, 0]
 lb = [0, 0, 0]
 ub = [1, 1, 2*np.pi]

@@ -1,3 +1,5 @@
+# extended jacobin kalman filter without vibrations
+
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
@@ -13,14 +15,7 @@ def kalmanFit3(alp, P_exp):
     ph = np.zeros(len(alp))
     e = np.zeros(len(alp))
     P_m = np.zeros(len(alp))
-
-    # matrix init
-    P_cov = np.diag([0.0022, 0.003*2, 0.11**2])
-
-    Q = np.diag([0, 0, 0])
-
-
-    R = 0.047**2
+    P_cov = np.zeros((len(alp), 3, 3))
 
     # init values
     poi = 201
@@ -29,9 +24,15 @@ def kalmanFit3(alp, P_exp):
     ub = [1, 1, 2*np.pi]
     popt, pcov = curve_fit(model, alp[:poi], P_exp[:poi], p0=p0, bounds=(lb, ub))
     A[0], B[0], ph[0] = popt
+    sigma_A, sigma_B, sigma_ph = np.sqrt(np.diag(pcov))
     P_m[0] = model(alp[0], A[0], B[0], ph[0])
 
+    # matrix init
+    P_cov[0] = np.diag([sigma_A**2, sigma_B**2, sigma_ph**2]) # diag, можно ещё правило трёх sigma
+    Q = np.diag([1e-8, 1e-8, 1e-7])
+    R = 0.047**2
 
+    # main cycle
     for i in range(1, len(alp)):
 
         # Jacobian
@@ -39,7 +40,7 @@ def kalmanFit3(alp, P_exp):
         H = np.array([1, np.cos(Ph_i), B[i-1]*np.sin(Ph_i)])
 
         # prediction step
-        P_cov = P_cov + Q 
+        P_cov[i] = P_cov[i-1] + Q 
 
         # model prediction
         P_m[i] = A[i-1] + B[i-1]*np.cos(Ph_i)
@@ -48,18 +49,18 @@ def kalmanFit3(alp, P_exp):
         e[i] = P_exp[i] - P_m[i]
 
         # measurement covariance/uncertinty
-        S_i = H @ P_cov @ H.T + R
+        S_i = H @ P_cov[i] @ H.T + R
 
         
         # Kalman gain
-        K_i = P_cov @ H.T / S_i    
+        K_i = P_cov[i] @ H.T / S_i    
         
         # update
         A[i] = A[i-1] + K_i[0]*e[i]
         B[i] = B[i-1] + K_i[1]*e[i]
         ph[i] = ph[i-1] + K_i[2]*e[i]
 
-        P_cov = (np.eye(3) - np.outer(K_i, H)) @ P_cov
+        P_cov[i] = (np.eye(3) - np.outer(K_i, H)) @ P_cov[i]
 
         # I = np.eye(3)
         # KH = np.outer(K_i, H)
@@ -67,7 +68,7 @@ def kalmanFit3(alp, P_exp):
         # P_cov = ((I - KH) @ P_cov @ (I - KH).T + np.outer(K_i, K_i) * R)
 
 
-    return P_m, A, B, ph
+    return P_m, A, B, ph, P_cov
 
 plt.figure()
 
@@ -91,12 +92,12 @@ plt.plot(normkp, label="exp")
 # kalman fit
 alp = scankp
 P_exp = normkp
-P_m, A, B, ph = kalmanFit3(alp, P_exp)
+P_m, A, B, ph, P_cov = kalmanFit3(alp, P_exp)
 plt.plot(model(alp, A, B, ph), label="kalman")
 plt.plot(model(alp, A[0], B[0], ph[0]), label="sin")
 plt.legend()
 
-#plt.figure()
+
 fig, axs = plt.subplots(1, 3, figsize=(14, 4))
 axs[0].plot(A)
 axs[0].set_title('A')
@@ -108,5 +109,17 @@ axs[1].set_title('B')
 # Третий график (нижний левый)
 axs[2].plot(ph)  # или axs[1, 0]
 axs[2].set_title('$\phi$')
+
+fig1, axss = plt.subplots(1, 3, figsize=(14, 4))
+axss[0].plot(P_cov[:, 0, 0])
+axss[0].set_title('dA')
+
+# Второй график (верхний правый)
+axss[1].plot(P_cov[:, 1, 1])
+axss[1].set_title('dB')
+
+# Третий график (нижний левый)
+axss[2].plot(P_cov[:, 2, 2])  # или axs[1, 0]
+axss[2].set_title('$d\phi$')
 
 plt.show()
