@@ -37,7 +37,7 @@ def HJacobian(x, alpha, T):
 
     return H
 
-def kalmanFit3(alp, P_exp):
+def kalmanFit_EKF(alp, P_exp):
 
     N = len(alp)
 
@@ -88,7 +88,7 @@ def kalmanFit3(alp, P_exp):
     # uncertainties from initial curve fit
 
     sigma_P = np.std(P_exp[:poi] - model(alp[:poi], A[0], B[0], ph[0])) # for real data
-    sigma_P = 0.2e-3 # for simulation
+    sigma_P = 2e-3 # for simulation
 
     # --------------------------------------------------
     # Create EKF
@@ -111,7 +111,7 @@ def kalmanFit3(alp, P_exp):
     P_cov[0] = ekf.P
     # process noise
     #Q = np.diag([1e-9,1e-9,1e-7]) # good for exp test data
-    Q = np.diag([1e-6,1e-6, 1e-6]) # for sim test data
+    Q = np.diag([4e-7,4e-7, 4e-7]) # for sim test data
     ekf.Q = Q
 
     # measurement noise
@@ -166,9 +166,6 @@ def kalmanFit3(alp, P_exp):
         ph[i] = ekf.x[2]
 
 
-        # innovation
-        e[i] = P_exp[i] - P_m[i]
-
         # covariance
         P_cov[i] = ekf.P
 
@@ -206,18 +203,18 @@ for i in range(len(scankp)):
     BD = 0.01
     B_sim[i] = B0 + BD * np.cos(2*np.pi/50*i) + np.random.normal(0, 1e-3)
     ph_sim[i] = ph_sim[i] + np.random.normal(0, 1e-3)
-    normkp[i] = A_sim[i] + B_sim[i]*np.cos(2*np.pi*scankp[i]*T**2-ph_sim[i]) + np.random.normal(0, 0.2e-3)
+    normkp[i] = A_sim[i] + B_sim[i]*np.cos(2*np.pi*scankp[i]*T**2-ph_sim[i]) + np.random.normal(0, 2e-3)
 
 
 # kalman fit
 alp = scankp
 P_exp = normkp
-P_m, A, B, ph, P_cov, e, en = kalmanFit3(alp, P_exp)
+P_m, A, B, ph, P_cov, e, en = kalmanFit_EKF(alp, P_exp)
 
 
 # main graphic
 plt.figure()
-plt.plot(normkp, label="exp")
+plt.plot(normkp, label="data")
 plt.plot(model(alp, A, B, ph), label="kalman")
 plt.plot(model(alp, A[0], B[0], ph[0]), label="sin")
 plt.legend()
@@ -259,36 +256,36 @@ plt.legend()
 # print(f"std norm e ={np.std(en)}")
 
 
-# simulation test, работает крайне спорно, пока не стоит использовать
-figa, axsa = plt.subplots(1, 3, figsize=(14, 4))
-axsa[0].plot(np.sqrt(P_cov[:, 0, 0]), label = "filter")
-axsa[0].plot(A - A_sim, label = "sim")
-axsa[0].set_title('dA')
-coverage_A = np.mean(np.abs(A - A_sim) <= np.sqrt(P_cov[:, 0, 0]))
-print("A 1-sigma coverage =", coverage_A)
-z_A = (A - A_sim) / np.sqrt(P_cov[:,0,0])
-print(f"z_A mean = {np.mean(z_A)}")
-print(f"z_A std = {np.std(z_A)}")
-plt.legend()
+# # simulation test, работает крайне спорно, пока не стоит использовать
+# figa, axsa = plt.subplots(1, 3, figsize=(14, 4))
+# axsa[0].plot(np.sqrt(P_cov[:, 0, 0]), label = "filter")
+# axsa[0].plot(A - A_sim, label = "sim")
+# axsa[0].set_title('dA')
+# coverage_A = np.mean(np.abs(A - A_sim) <= np.sqrt(P_cov[:, 0, 0]))
+# print("A 1-sigma coverage =", coverage_A)
+# z_A = (A - A_sim) / np.sqrt(P_cov[:,0,0])
+# print(f"z_A mean = {np.mean(z_A)}")
+# print(f"z_A std = {np.std(z_A)}")
+# plt.legend()
 
-# Второй график
-axsa[1].plot(np.sqrt(P_cov[:, 1, 1]), label = "filter")
-axsa[1].plot(B - B_sim, label = "sim")
-axsa[1].set_title('dB')
-coverage_B = np.mean(np.abs(B - B_sim) <= np.sqrt(P_cov[:, 1, 1]))
-print("B 1-sigma coverage =", coverage_B)
-z_B = (B - B_sim) / np.sqrt(P_cov[:,1,1])
-print(f"z_B mean = {np.mean(z_B)}")
-print(f"z_B std = {np.std(z_B)}")
-plt.legend()
+# # Второй график
+# axsa[1].plot(np.sqrt(P_cov[:, 1, 1]), label = "filter")
+# axsa[1].plot(B - B_sim, label = "sim")
+# axsa[1].set_title('dB')
+# coverage_B = np.mean(np.abs(B - B_sim) <= np.sqrt(P_cov[:, 1, 1]))
+# print("B 1-sigma coverage =", coverage_B)
+# z_B = (B - B_sim) / np.sqrt(P_cov[:,1,1])
+# print(f"z_B mean = {np.mean(z_B)}")
+# print(f"z_B std = {np.std(z_B)}")
+# plt.legend()
 
-# Третий график
-lm = 780e-9
-keff = 4*np.pi/lm
-axsa[2].plot(np.sqrt(P_cov[:, 2, 2]), label = "filter")
-axsa[2].plot(ph - ph_sim, label = "sim")
-axsa[2].set_title(r'd$\phi$')
-plt.legend()
+# # Третий график
+# lm = 780e-9
+# keff = 4*np.pi/lm
+# axsa[2].plot(np.sqrt(P_cov[:, 2, 2]), label = "filter")
+# axsa[2].plot(ph - ph_sim, label = "sim")
+# axsa[2].set_title(r'd$\phi$')
+# plt.legend()
 
 
 
