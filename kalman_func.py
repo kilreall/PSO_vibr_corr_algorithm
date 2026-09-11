@@ -171,24 +171,128 @@ def kalmanFit_EKF(alp, P_exp, T, init_method, poi, Q, P_cov0, sigma_P):
 
     return P_m, A, B, ph, P_cov, e, en
 
-def kalman_graphs(alp, P_m, A, B, ph, P_cov, e, en):
+def windowFit(alp, P_exp, T, window=5):
+
+    lm=780e-9
+    N = len(alp)
+
+    keff = 4*np.pi/lm
+
+    # результаты
+    g = np.full(N, np.nan)
+    A_fit = np.full(N, np.nan)
+    B_fit = np.full(N, np.nan)
+    ph_fit = np.full(N, np.nan)
+
+    # половина окна
+    half = window // 2
+
+    for i in range(half, N-half):
+
+        # -----------------------------------------
+        # текущее окно
+        # -----------------------------------------
+
+        sl = slice(i-half, i+half+1)
+
+        x = alp[sl]
+        y = P_exp[sl]
+
+        # -----------------------------------------
+        # начальные значения
+        # -----------------------------------------
+
+        A0 = (np.max(y) + np.min(y)) / 2
+        B0 = (np.max(y) - np.min(y)) / 2
+
+        # начальная оценка фазы
+        idx_min = np.argmin(y)
+
+        phi0 = (
+            2*np.pi*x[idx_min]*T**2
+            - np.pi
+        )
+
+        # -----------------------------------------
+        # fit
+        # -----------------------------------------
+
+        try:
+
+            popt, pcov = curve_fit(
+                model,
+                x,
+                y,
+                p0=[A0, B0, phi0],
+                bounds=(
+                    [-1.1, 0, -np.inf],
+                    [1.1, 1.1, np.inf]
+                ),
+                maxfev=10000
+            )
+
+            Ai, Bi, phi = popt
+
+            # -----------------------------------------
+            # выбор правильной ветви фазы
+            # -----------------------------------------
+
+            phi_target = (
+                2*np.pi*x[idx_min]*T**2
+                - np.pi
+            )
+
+            M = np.round(
+                (phi_target - phi)/(2*np.pi)
+            )
+
+            phi = phi + 2*np.pi*M
+
+            # -----------------------------------------
+            # вычисление g
+            # -----------------------------------------
+
+            gi = phi/(keff*T**2)
+
+            # -----------------------------------------
+            # сохранение результата
+            # -----------------------------------------
+
+            g[i] = gi
+            A_fit[i] = Ai
+            B_fit[i] = Bi
+            ph_fit[i] = phi
+
+        except (RuntimeError, ValueError):
+            pass
+
+    return g
+
+
+
+def kalmanGraphs(alp, P_exp, A, B, ph, P_cov, e, en):
 
     # main graphic
     plt.figure()
     plt.plot(P_exp, label="data")#, marker="o")
     plt.plot(model(alp, A, B, ph), label="kalman")
+    plt.plot(P_sim, label="true data")
     #plt.plot(model(alp, A[0], B[0], ph[0]), label="sin")
     plt.legend()
 
     # additional graphics
     plt.title("koef dynamics")
     fig, axs = plt.subplots(1, 3, figsize=(14, 4))
-    axs[0].plot(A)
+    axs[0].plot(A, label="kalman")
+    axs[0].plot(A_sim, label="simulation")
     axs[0].set_title('A')
+    plt.legend()
 
     # Второй график
-    axs[1].plot(B)
+    axs[1].plot(B, label="kalman")
+    axs[1].plot(B_sim, label="simulation")
     axs[1].set_title('B')
+    plt.legend()
 
     # Третий график
     lm = 780e-9
@@ -198,18 +302,20 @@ def kalman_graphs(alp, P_m, A, B, ph, P_cov, e, en):
     M = np.round( (ph_target - ph) / (2 * np.pi) )
     ph = ph + 2 * np.pi * M
     #axs[2].plot(ph) 
-    axs[2].plot(ph/keff/T/T*1e5, label="kalman")
+    g_kalman = ph/keff/T/T
+    axs[2].plot(g_kalman*1e5, label="kalman")
 
-    # for comparison
-    g_comp = np.load("g_slide_delay800_w5.npy")
-    dots = np.arange(0, len(alp), 5)
-    axs[2].plot(dots, g_comp*1e5*-1, label="comparison")
+    # comparison
+    g_sim = np.ones(len(alp)) * g
+    axs[2].plot(g_sim*1e5, label="simulation")
+    g_window = windowFit(alp, P_exp, T, 5)
+    axs[2].plot(g_window*1e5, label="window")
     # --- Savitzky-Golay для сравнения ---
     # окно должно быть нечётным и меньше длины массива
     window_length = 21          # можно менять (11, 21, 51, 101...)
     polyorder = 3
-    g_savgol = savgol_filter(g_comp*-1, window_length=window_length, polyorder=polyorder)
-    axs[2].plot(dots, g_savgol*1e5, label="savgol")
+    g_savgol = savgol_filter(g_window, window_length=window_length, polyorder=polyorder)
+    axs[2].plot(g_savgol*1e5, label="savgol")
 
     axs[2].set_title(r'$g$')
     plt.legend()
@@ -228,8 +334,12 @@ def kalman_graphs(alp, P_m, A, B, ph, P_cov, e, en):
     # Третий график
     lm = 780e-9
     keff = 4*np.pi/lm
-    axss[2].plot(np.sqrt(P_cov[:, 2, 2])/keff/T/T*1e5)  # или axs[1, 0]
+    axss[2].plot(np.sqrt(P_cov[:, 2, 2])/keff/T/T*1e5, label="kalman eval")  # или axs[1, 0]
+    axss[2].plot(abs(g_kalman - g_sim)*1e5, label='kalman diff')
+    axss[2].plot(abs(g_window - g_sim)*1e5, label='window diff')
+    axss[2].plot(abs(g_savgol - g_sim)*1e5, label='savgol_diff')
     axss[2].set_title('$dg$')
+    plt.legend()
 
     # Q finder
     # plt.figure()
@@ -239,12 +349,41 @@ def kalman_graphs(alp, P_m, A, B, ph, P_cov, e, en):
     print(f"std norm e ={np.std(en)}")
 
 
-data = np.load("data_delay_800.npy")
+
 
 T = 10e-3
-# kalman fit
+
+
+# experimental data
+data = np.load("data_delay_800.npy")
 alp = data[0]*1e6 # 1e6 из-за особенности data
 P_exp = data[1]
+
+# smimulation data
+g = 9.8101507
+lm = 780e-9
+keff = 4*np.pi/lm
+A_sim = np.zeros(len(alp))
+A0 = 0.15
+dA_sim = 1e-3
+DA_sim = 3e-5
+B_sim = np.zeros(len(alp))
+B0 = 0.21
+dB_sim = 1e-3
+ph_sim = np.zeros(len(alp))
+dph_sim = 1e-4
+P_sim = np.zeros(len(alp))
+P_sim_noise = np.zeros(len(alp))
+dP_sim = 1e-3
+for i in range(len(alp)):
+    A_sim[i] = A0 + DA_sim*i + np.random.normal(0, dA_sim)
+    B_sim[i] = B0 + np.random.normal(0, dB_sim)
+    ph_sim[i] = keff*g*T*T + np.random.normal(0, dph_sim)
+    P_sim[i] = A_sim[i] + B_sim[i]*np.cos(2*np.pi*alp[i]*T*T - ph_sim[i])
+    P_sim_noise[i] = P_sim[i] + np.random.normal(0, dP_sim)
+    
+
+# kalman fit
 init_method = "fit"
 poi = len(alp)
 P_cov0 = np.diag([1,1,1])*1e-3
@@ -254,14 +393,18 @@ dg_model = 0.1 # mGal
 dA_model = 1e-3
 dB_model = 1e-3
 
+dA_model = np.sqrt(dA_sim**2 + DA_sim**2)
+dB_model = dB_sim
+
 lm = 780e-9
 keff = 4*np.pi/lm
 dph_model = dg_model*keff*T*T/1e5
 print(f"dph_model = {dph_model}")
+dph_model = dph_sim # for simulation
 Q = np.diag([dA_model**2, dB_model**2, dph_model**2])
-P_m, A, B, ph, P_cov, e, en = kalmanFit_EKF(alp, P_exp, T, init_method, poi, Q, P_cov0, sigma_P)
+P_m, A, B, ph, P_cov, e, en = kalmanFit_EKF(alp, P_sim_noise, T, init_method, poi, Q, P_cov0, sigma_P)
 
-kalman_graphs(alp, P_m, A, B, ph, P_cov, e, en)
+kalmanGraphs(alp, P_sim_noise, A, B, ph, P_cov, e, en)
 
 
 plt.show()

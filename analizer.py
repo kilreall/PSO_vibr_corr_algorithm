@@ -37,7 +37,7 @@ def sliding_fit_g(corr, norm, T_coef, window=1, lm=780e-9, T_int=0.01):
 
     half = window // 2
 
-    for i in range(half, N - half, window):
+    for i in range(half, N - half, 1):
         sl = slice(i - half, i + half + 1)
         x = corr[sl]
         y = norm[sl]
@@ -131,7 +131,7 @@ window = 5
 g_slide, A_s, B_s, ph_s, ok = sliding_fit_g(corr, norm, T, window=window, T_int=0.01)
 g_valid = g_slide[ok]
 # сохраняем
-np.save(f"g_slide_delay{delay}_w{window}.npy", g_valid)
+np.save(f"g_slide_delay{delay}_w{window}.npy", g_slide)
 # np.save(f"ph_slide_delay{delay}_w{window}.npy", ph_s)
 # np.save(f"ok_slide_delay{delay}_w{window}.npy", ok)
 
