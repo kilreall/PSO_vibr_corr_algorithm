@@ -9,6 +9,32 @@ from scipy.signal import savgol_filter
 def model(alp, A, B, ph):
     return A - B*np.cos(2*np.pi*alp*T**2 - ph)
 
+
+def init_values(alp, P_exp, poi):
+
+    alp_init = alp.copy()
+    P_init = P_exp.copy()
+    # idx = np.argsort(alp_init)
+    # alp_init = alp_init[idx]
+    # P_init  = P_init[idx]
+
+
+    p0 = [ (np.max(P_init[:poi]) + np.min(P_init[:poi])) / 2, (np.max(P_init[:poi]) - np.min(P_init[:poi])) / 2, 0]
+    lb = [-1.1, 0, 0]
+    ub = [1.1, 1.1, 2*np.pi]
+    popt, pcov = curve_fit(model, alp_init[:poi], P_init[:poi], p0=p0, bounds=(lb, ub))
+    A0, B0, ph0 = popt
+    sigma_A = np.std(P_init[:poi] - model(alp_init[:poi], A0, B0, ph0)) # for real data
+
+    # # test init fit
+    # plt.figure()
+    # plt.plot(alp_init, P_init)
+    # plt.plot(alp_init, model(alp_init, A0, B0, ph0))
+
+
+    return A0, B0, ph0, pcov, sigma_A
+
+
 def Hx(x, alpha, T):
 
     A = x[0]
@@ -21,40 +47,6 @@ def Hx(x, alpha, T):
 
     return np.array([P])
 
-
-def init_values(alp, P_exp, method, poi, T, sigma_P, pcov):
-
-    alp_init = alp.copy()
-    P_init = P_exp.copy()
-    # idx = np.argsort(alp_init)
-    # alp_init = alp_init[idx]
-    # P_init  = P_init[idx]
-
-    if method == "fit":
-        p0 = [ (np.max(P_init[:poi]) + np.min(P_init[:poi])) / 2, (np.max(P_init[:poi]) - np.min(P_init[:poi])) / 2, 0]
-        lb = [-1.1, 0, 0]
-        ub = [1.1, 1.1, 2*np.pi]
-        popt, pcov = curve_fit(model, alp_init[:poi], P_init[:poi], p0=p0, bounds=(lb, ub))
-        A0, B0, ph0 = popt
-        sigma_P = np.std(P_init[:poi] - model(alp_init[:poi], A0, B0, ph0)) # for real data
-
-        # # test init fit
-        # plt.figure()
-        # plt.plot(alp_init, P_init)
-        # plt.plot(alp_init, model(alp_init, A0, B0, ph0))
-
-
-        return A0, B0, ph0, pcov, sigma_P
-
-    elif method == "eval":
-        A0 = (np.max(P_init[:poi]) + np.min(P_init[:poi]))/2
-        B0 = (np.max(P_init[:poi]) - np.min(P_init[:poi])) / 2
-        lm = 780e-9
-        keff = 4*np.pi/lm
-        g = 9.8125
-        ph0 = keff*g*T**2 % (2*np.pi)
-        return A0, B0, ph0, pcov, sigma_P
-
 def HJacobian(x, alpha, T):
 
     A = x[0]
@@ -66,13 +58,13 @@ def HJacobian(x, alpha, T):
     H = np.array([
         [1.0,
          -np.cos(Phi),
-         -B*np.sin(Phi)]
+         -B*np.sin(Phi), 0]
     ])
 
     return H
 
 
-def kalmanFit_EKF(alp, P_exp, T, init_method, poi, Q, P_cov0, sigma_P):
+def kalmanFit_EKF(alp, P_exp, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0, v_ph0):
 
     N = len(alp)
 
@@ -83,19 +75,20 @@ def kalmanFit_EKF(alp, P_exp, T, init_method, poi, Q, P_cov0, sigma_P):
     A = np.zeros(N)
     B = np.zeros(N)
     ph = np.zeros(N)
+    v_ph = np.zeros(N)
     P_m = np.zeros(N)
     e = np.zeros(N)
     en = np.zeros(N)
-    P_cov = np.zeros((N, 3, 3))
+    P_cov = np.zeros((N, 4, 4))
 
     # --------------------------------------------------
     # Initialization
     # --------------------------------------------------
 
     # create EKF
-    ekf = ExtendedKalmanFilter(dim_x=3, dim_z=1)
+    ekf = ExtendedKalmanFilter(dim_x=4, dim_z=1)
 
-    A[0], B[0], ph[0], ekf.P, sigma_P = init_values(alp, P_exp, init_method, poi, T, sigma_P, P_cov0)
+    A[0], B[0], ph[0], v_ph[0], ekf.P = A0, B0, ph0, v_ph0, P_cov0
 
     # initial covariance
     P_cov[0] = ekf.P
@@ -108,12 +101,17 @@ def kalmanFit_EKF(alp, P_exp, T, init_method, poi, Q, P_cov0, sigma_P):
     )
 
     # state = [A, B, phi]
-    ekf.x = np.array([A[0], B[0], ph[0]])
+    ekf.x = np.array([A[0], B[0], ph[0], v_ph[0]])
 
     # process noise
     ekf.Q = Q
 
-    sigma_P = dP_sim # only for simulation
+    ekf.F = np.array([
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 1.0],
+    [0.0, 0.0, 0.0, 1.0]
+    ])
 
 
     # --------------------------------------------------
@@ -144,7 +142,7 @@ def kalmanFit_EKF(alp, P_exp, T, init_method, poi, Q, P_cov0, sigma_P):
 
         # measurement noise
         ekf.R = np.array([
-            [sigma_P**2 + B[i-1]**2*np.sin(2*np.pi*alp[i]*T*T - ph[i-1])**2*sigma_ph_vibr**2]
+            [sigma_A**2 + B[i-1]**2*np.sin(2*np.pi*alp[i]*T*T - ph[i-1])**2*sigma_ph**2]
         ])
 
         ekf.update(
@@ -166,8 +164,8 @@ def kalmanFit_EKF(alp, P_exp, T, init_method, poi, Q, P_cov0, sigma_P):
         A[i] = ekf.x[0]
         B[i] = ekf.x[1]
         ph[i] = ekf.x[2]
-
-
+        v_ph[i] = ekf.x[3]
+    
         # covariance
         P_cov[i] = ekf.P
 
@@ -303,7 +301,6 @@ def kalmanGraphs(alp, P_exp, A, B, ph, P_cov, e, en):
     axs[2].plot(g_kalman*1e5, label="kalman")
 
     # comparison
-    g_sim = np.ones(len(alp)) * g
     axs[2].plot(g_sim*1e5, label="simulation")
     g_window = windowFit(alp, P_exp, T, 20)
     axs[2].plot(g_window*1e5, label="window")
@@ -372,14 +369,14 @@ g0 = 9.8101507
 Dg = 300*1e-8
 lm = 780e-9
 keff = 4*np.pi/lm
-Dph = Dg*keff*T*T/15
+dv_ph_sim = 1e-5
 alp_min = keff*g0/2/np.pi - 1/5/T/T
 alp_max = keff*g0/2/np.pi + 1/5/T/T
 print((alp_min + alp_max)/2)
 alp_amount = 20
 alp_start = np.linspace(alp_min, alp_max, alp_amount)
 alp = np.zeros(1000)
-g = np.zeros(len(alp))
+g_sim = np.zeros(len(alp))
 Ph = np.zeros(len(alp))
 F_vib = np.zeros(len(alp))
 sigma_ph_vibr = 1e-4
@@ -394,19 +391,19 @@ ph_sim = np.zeros(len(alp))
 dph_sim = 1e-4*0
 P_sim = np.zeros(len(alp))
 P_sim_noise = np.zeros(len(alp))
-dP_sim = 1e-3
+sigma_A_sim = 1e-3
 for i in range(len(alp)):
-    g[i] = g0 + Dg*np.sin(2*np.pi/100*i)
+    g_sim[i] = g0 + Dg*np.sin(2*np.pi/100*i)
     F_vib[i] = np.random.uniform(-np.pi/12, np.pi/12)
     alp[i] = alp_start[i%alp_amount] - F_vib[i]/2/np.pi/T/T
     A_sim[i] = A0 + DA_sim*i + np.random.normal(0, dA_sim)
     B_sim[i] = B0 + np.random.normal(0, dB_sim)
-    ph_sim[i] = keff*g[i]*T*T + np.random.normal(0, dph_sim)
+    ph_sim[i] = keff*g_sim[i]*T*T + np.random.normal(0, dph_sim)
     Ph[i] = 2*np.pi*alp[i]*T*T - ph_sim[i]
     P_sim[i] = A_sim[i] - B_sim[i]*np.cos(Ph[i])
     F_vib[i] += np.random.normal(0, sigma_ph_vibr)
     alp[i] = alp_start[i%alp_amount] - F_vib[i]/2/np.pi/T/T
-    P_sim_noise[i] = P_sim[i] + np.random.normal(0, dP_sim)
+    P_sim_noise[i] = P_sim[i] + np.random.normal(0, sigma_A_sim)
     
 
 
@@ -414,7 +411,7 @@ for i in range(len(alp)):
 # kalman fit
 init_method = "fit"
 poi = 20 #len(alp)
-P_cov0 = np.diag([1,1,1])*1e-3
+P_cov0 = np.diag([1, 1, 1, 1])*1e-3
 sigma_P = 1e-4
 
 dg_model = 0.1 # mGal
@@ -428,9 +425,22 @@ lm = 780e-9
 keff = 4*np.pi/lm
 dph_model = dg_model*keff*T*T/1e5
 print(f"dph_model = {dph_model}")
-dph_model = np.sqrt(dph_sim**2*0 + Dph**2) # for simulation
-Q = np.diag([dA_model**2, dB_model**2, dph_model**2])
-P_m, A, B, ph, P_cov, e, en = kalmanFit_EKF(alp, P_sim_noise, T, init_method, poi, Q, P_cov0, sigma_P)
+dph_model = np.sqrt(dph_sim**2) # for simulation
+dv_ph_model = dv_ph_sim
+Q = np.diag([dA_model**2, dB_model**2, dph_model**2, dv_ph_model])
+
+# initial values
+sigma_ph = sigma_ph_vibr
+A0, B0, ph0, P_cov_3d, sigma_A = init_values(alp, P_exp, poi)
+v_ph0 = 1e-3
+P_cov0 = np.zeros((4,4))
+for i in range(3):
+    for j in range(3):
+        P_cov0[i,j] = P_cov_3d[i,j]
+P_cov0[3,3] = 1e-3
+sigma_A = sigma_A_sim # only for sim
+P_m, A, B, ph, P_cov, e, en = kalmanFit_EKF(alp, P_sim_noise, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0, v_ph0)
+
 
 kalmanGraphs(alp, P_sim_noise, A, B, ph, P_cov, e, en)
 
