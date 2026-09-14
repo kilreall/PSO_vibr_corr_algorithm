@@ -114,6 +114,7 @@ def kalmanFit_EKF(alp, P_exp, T, init_method, poi, Q, P_cov0, sigma_P):
     # process noise
     ekf.Q = Q
 
+    sigma_P = dP_sim # only for simulation
     # measurement noise
     ekf.R = np.array([
         [sigma_P**2]
@@ -314,7 +315,18 @@ def kalmanGraphs(alp, P_exp, A, B, ph, P_cov, e, en):
     # окно должно быть нечётным и меньше длины массива
     window_length = 21          # можно менять (11, 21, 51, 101...)
     polyorder = 3
-    g_savgol = savgol_filter(g_window, window_length=window_length, polyorder=polyorder)
+
+    # для исправления nan
+    valid = np.isfinite(g_window)
+    g_savgol = np.full_like(g_window, np.nan)
+    if np.sum(valid) >= window_length:
+        g_savgol[valid] = savgol_filter(g_window[valid], window_length=window_length, polyorder=polyorder)
+
+
+    #g_savgol = savgol_filter(g_window, window_length=window_length, polyorder=polyorder) # работает в институте
+
+
+
     axs[2].plot(g_savgol*1e5, label="savgol")
 
     axs[2].set_title(r'$g$')
@@ -335,9 +347,9 @@ def kalmanGraphs(alp, P_exp, A, B, ph, P_cov, e, en):
     lm = 780e-9
     keff = 4*np.pi/lm
     axss[2].plot(np.sqrt(P_cov[:, 2, 2])/keff/T/T*1e5, label="kalman eval")  # или axs[1, 0]
-    axss[2].plot(abs(g_kalman - g_sim)*1e5, label='kalman diff')
-    axss[2].plot(abs(g_window - g_sim)*1e5, label='window diff')
-    axss[2].plot(abs(g_savgol - g_sim)*1e5, label='savgol_diff')
+    axss[2].plot((g_kalman - g_sim)*1e5, label='kalman diff')
+    axss[2].plot((g_window - g_sim)*1e5, label='window diff')
+    axss[2].plot((g_savgol - g_sim)*1e5, label='savgol_diff')
     axss[2].set_title('$dg$')
     plt.legend()
 
@@ -385,7 +397,7 @@ for i in range(len(alp)):
 
 # kalman fit
 init_method = "fit"
-poi = len(alp)
+poi = 201 #len(alp)
 P_cov0 = np.diag([1,1,1])*1e-3
 sigma_P = 1e-4
 
