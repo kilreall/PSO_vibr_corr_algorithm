@@ -58,13 +58,13 @@ def HJacobian(x, alpha, T):
     H = np.array([
         [1.0,
          -np.cos(Phi),
-         -B*np.sin(Phi), 0]
+         -B*np.sin(Phi), 0, 0]
     ])
 
     return H
 
 
-def kalmanFit_EKF(alp, P_exp, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0, v_ph0):
+def kalmanFit_EKF(alp, P_exp, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0, v_ph0, a_ph00):
 
     N = len(alp)
 
@@ -76,19 +76,20 @@ def kalmanFit_EKF(alp, P_exp, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0, v_ph
     B = np.zeros(N)
     ph = np.zeros(N)
     v_ph = np.zeros(N)
+    a_ph = np.zeros(N)
     P_m = np.zeros(N)
     e = np.zeros(N)
     en = np.zeros(N)
-    P_cov = np.zeros((N, 4, 4))
+    P_cov = np.zeros((N, 5, 5))
 
     # --------------------------------------------------
     # Initialization
     # --------------------------------------------------
 
     # create EKF
-    ekf = ExtendedKalmanFilter(dim_x=4, dim_z=1)
+    ekf = ExtendedKalmanFilter(dim_x=5, dim_z=1)
 
-    A[0], B[0], ph[0], v_ph[0], ekf.P = A0, B0, ph0, v_ph0, P_cov0
+    A[0], B[0], ph[0], v_ph[0], a_ph[0], ekf.P = A0, B0, ph0, v_ph0, a_ph0, P_cov0
 
     # initial covariance
     P_cov[0] = ekf.P
@@ -101,17 +102,19 @@ def kalmanFit_EKF(alp, P_exp, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0, v_ph
     )
 
     # state = [A, B, phi]
-    ekf.x = np.array([A[0], B[0], ph[0], v_ph[0]])
+    ekf.x = np.array([A[0], B[0], ph[0], v_ph[0], a_ph[0]])
 
     # process noise
     ekf.Q = Q
 
     ekf.F = np.array([
-    [1.0, 0.0, 0.0, 0.0],
-    [0.0, 1.0, 0.0, 0.0],
-    [0.0, 0.0, 1.0, 1.0],
-    [0.0, 0.0, 0.0, 1.0]
+    [1.0, 0.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 1.0, 0.5],
+    [0.0, 0.0, 0.0, 1.0, 1.0],
+    [0.0, 0.0, 0.0, 0.0, 1.0]
     ])
+
 
 
     # --------------------------------------------------
@@ -165,11 +168,12 @@ def kalmanFit_EKF(alp, P_exp, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0, v_ph
         B[i] = ekf.x[1]
         ph[i] = ekf.x[2]
         v_ph[i] = ekf.x[3]
+        a_ph[i] = ekf.x[4]
     
         # covariance
         P_cov[i] = ekf.P
 
-    return P_m, A, B, ph, v_ph, P_cov, e, en
+    return P_m, A, B, ph, v_ph, a_ph, P_cov, e, en
 
 def windowFit(alp, P_exp, T, window):
 
@@ -275,7 +279,7 @@ def kalmanGraphs(alp, P_exp, A, B, ph, v_ph, P_cov, e, en):
     plt.legend()
 
     # additional graphics
-    fig, axs = plt.subplots(1, 4, figsize=(14, 4))
+    fig, axs = plt.subplots(1, 5, figsize=(14, 4))
     plt.title("koef dynamics")
     axs[0].plot(A, label="kalman")
     axs[0].plot(A_sim, label="simulation")
@@ -329,6 +333,11 @@ def kalmanGraphs(alp, P_exp, A, B, ph, v_ph, P_cov, e, en):
     axs[3].set_title('v_ph')
     axs[3].legend()
 
+    # вторая производная 
+    axs[4].plot(a_ph, label="kalman")
+    axs[4].plot(a_ph_sim, label="simulation")
+    axs[4].set_title('a_ph')
+    axs[4].legend()
 
     
     # uncerteinty 
@@ -401,8 +410,12 @@ dB_sim = 1e-3*0
 
 ph_sim = np.zeros(N_sim)
 dph_sim = 1e-4*0
+
 v_ph_sim = np.zeros(N_sim)
-dv_ph_sim = Dg*2*np.pi*f*(1 - np.cos(2*np.pi*f))*keff*T*T/25
+dv_ph_sim = 0
+
+a_ph_sim = np.zeros(N_sim)
+
 
 P_sim = np.zeros(N_sim)
 P_sim_noise = np.zeros(N_sim)
@@ -412,6 +425,7 @@ sigma_A_sim = 1e-3
 for i in range(len(alp)):
     g_sim[i] = g0 + Dg*np.sin(2*np.pi*f*i)
     v_ph_sim[i] = Dg*2*np.pi*f*np.cos(2*np.pi*f*i)*keff*T**2
+    a_ph_sim[i] = -Dg*(2*np.pi*f)**2*np.sin(2*np.pi*f*i)*keff*T**2
     F_vib[i] = np.random.uniform(-np.pi/12, np.pi/12)
     alp[i] = alp_start[i%alp_amount] - F_vib[i]/2/np.pi/T/T
     A_sim[i] = A0_sim + DA_sim*i + np.random.normal(0, dA_sim)
@@ -428,33 +442,35 @@ for i in range(len(alp)):
 # kalman fit
 dA_model = np.sqrt(DA_sim**2 + dA_sim**2)
 dB_model = dB_sim
-
 dph_model = np.sqrt(dph_sim**2)
-dv_ph_model = np.std(v_ph_sim[1:] - np.roll(v_ph_sim, 1)[1:]) * 2 # dv_ph_sim
-Q = np.diag([dA_model**2, dB_model**2, dph_model**2, dv_ph_model**2])
+dv_ph_model = dv_ph_sim
+da_ph_model = np.std(a_ph_sim[1:] - np.roll(a_ph_sim, 1)[1:]) * 1.9
+Q = np.diag([dA_model**2, dB_model**2, dph_model**2, dv_ph_model**2, da_ph_model**2])
 
 # initial values
 poi = 20
 A0, B0, ph0, P_cov_3d, sigma_A = init_values(alp, P_sim_noise, poi)
-v_ph0 = Dg*2*np.pi*f*keff*T*T
+v_ph0 = Dg*2*np.pi*f*keff*T*T # incorrect?
+a_ph0 = 0
 
-P_cov0 = np.zeros((4,4))
+P_cov0 = np.zeros((5,5))
 for i in range(3):
     for j in range(3):
         P_cov0[i,j] = P_cov_3d[i,j]
 P_cov0[3,3] = (Dg*2*np.pi*f*keff*T*T/3)**2
+P_cov0[4,4] = (Dg*(2*np.pi*f)**2*keff*T*T/3)**2
 
 sigma_A = sigma_A_sim
 sigma_ph = sigma_ph_vibr
 
-P_m, A, B, ph, v_ph, P_cov, e, en = kalmanFit_EKF(alp, P_sim_noise, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0, v_ph0)
+P_m, A, B, ph, v_ph, a_ph, P_cov, e, en = kalmanFit_EKF(alp, P_sim_noise, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0, v_ph0, a_ph0)
 
 
 #kalmanGraphs(alp, P_sim_noise, A, B, ph, v_ph, P_cov, e, en)
 
+ 
 
 ### ФЧХ
-
 
 sim_params = dict(
     g0=g0, Dg=Dg, lm=lm, keff=keff, T=T,
@@ -467,12 +483,14 @@ sim_params = dict(
     sigma_A_sim=sigma_A_sim,
 )
 
+
+
 def simulate_data(f_mod, N, params, seed=None):
     """
-    Генерирует alp / g_sim / ph_sim / v_ph_sim / P_sim_noise по ТОЙ ЖЕ
-    модели и С ТЕМИ ЖЕ параметрами, что заданы в блоке симуляции выше
-    (params — это sim_params). Меняется только частота модуляции f_mod
-    и длина N.
+    Генерирует alp / g_sim / ph_sim / v_ph_sim / a_ph_sim / P_sim_noise по
+    ТОЙ ЖЕ модели и С ТЕМИ ЖЕ параметрами, что заданы в блоке симуляции
+    выше (params — это sim_params). Меняется только частота модуляции
+    f_mod и длина N.
     """
     if seed is not None:
         np.random.seed(seed)
@@ -488,6 +506,7 @@ def simulate_data(f_mod, N, params, seed=None):
     alp = np.zeros(N)
     g_sim = np.zeros(N)
     v_ph_sim = np.zeros(N)
+    a_ph_sim = np.zeros(N)
     Ph = np.zeros(N)
     F_vib = np.zeros(N)
     A_sim = np.zeros(N)
@@ -499,6 +518,7 @@ def simulate_data(f_mod, N, params, seed=None):
     for i in range(N):
         g_sim[i] = g0 + Dg*np.sin(2*np.pi*f_mod*i)
         v_ph_sim[i] = Dg*2*np.pi*f_mod*np.cos(2*np.pi*f_mod*i)*keff*T**2
+        a_ph_sim[i] = -Dg*(2*np.pi*f_mod)**2*np.sin(2*np.pi*f_mod*i)*keff*T**2
         F_vib[i] = np.random.uniform(-np.pi/12, np.pi/12)
         alp[i] = alp_start[i % alp_amount] - F_vib[i]/2/np.pi/T/T
         A_sim[i] = A0_sim + DA_sim*i + np.random.normal(0, dA_sim)
@@ -510,7 +530,7 @@ def simulate_data(f_mod, N, params, seed=None):
         alp[i] = alp_start[i % alp_amount] - F_vib[i]/2/np.pi/T/T
         P_sim_noise[i] = P_sim[i] + np.random.normal(0, sigma_A_sim)
  
-    return alp, g_sim, ph_sim, v_ph_sim, P_sim_noise
+    return alp, g_sim, ph_sim, v_ph_sim, a_ph_sim, P_sim_noise
  
  
 def simulate_and_track(f_mod, N=1000, params=sim_params, poi=poi, seed=None):
@@ -522,32 +542,37 @@ def simulate_and_track(f_mod, N=1000, params=sim_params, poi=poi, seed=None):
     keff = params['keff']
     Dg = params['Dg']
  
-    alp, g_sim, ph_sim, v_ph_sim, P_sim_noise = simulate_data(f_mod, N, params, seed=seed)
+    alp, g_sim, ph_sim, v_ph_sim, a_ph_sim, P_sim_noise = simulate_data(f_mod, N, params, seed=seed)
  
-    # Q строится в точности как выше: dA_model/dB_model из параметров симуляции,
-    # dph_model/dv_ph_model — по тем же формулам, что и в основном блоке.
+    # Q строится в точности как выше: dA_model/dB_model из параметров
+    # симуляции, dv_ph_model берётся готовым из params (та же логика,
+    # что и в основном блоке), da_ph_model — по той же эмпирической
+    # формуле std() приращений.
     dA_model = np.sqrt(params['DA_sim']**2 + params['dA_sim']**2)
     dB_model = params['dB_sim']
     dph_model = np.sqrt(params['dph_sim']**2)
-    dv_ph_model = np.std(v_ph_sim[1:] - np.roll(v_ph_sim, 1)[1:]) * 2
-    Q = np.diag([dA_model**2, dB_model**2, dph_model**2, dv_ph_model**2])
+    dv_ph_model = params['dv_ph_sim']
+    da_ph_model = np.std(a_ph_sim[1:] - np.roll(a_ph_sim, 1)[1:]) * 2
+    Q = np.diag([dA_model**2, dB_model**2, dph_model**2, dv_ph_model**2, da_ph_model**2])
  
     sigma_ph = params['sigma_ph_vibr']
     A0, B0, ph0, P_cov_3d, sigma_A = init_values(alp, P_sim_noise, poi)
     v_ph0 = Dg*2*np.pi*f_mod*keff*T*T
+    a_ph0 = 0
  
     # P_cov0 собирается так же, как выше: 3x3 блок из init_values,
-    # плюс отдельная дисперсия для v_ph.
-    P_cov0 = np.zeros((4, 4))
+    # плюс отдельные дисперсии для v_ph и a_ph.
+    P_cov0 = np.zeros((5, 5))
     for a in range(3):
         for b in range(3):
             P_cov0[a, b] = P_cov_3d[a, b]
     P_cov0[3, 3] = (Dg*keff*T*T/3)**2
+    P_cov0[4, 4] = (Dg*keff*T*T/3)**2
  
     sigma_A = params['sigma_A_sim']  # only for sim
  
-    _, A, B, ph, v_ph, _, _, _ = kalmanFit_EKF(
-        alp, P_sim_noise, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0, v_ph0
+    _, A, B, ph, v_ph, a_ph, _, _, _ = kalmanFit_EKF(
+        alp, P_sim_noise, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0, v_ph0, a_ph0
     )
  
     g_kalman = ph/keff/T**2  # непрерывная величина, развёртка веток не нужна
@@ -587,15 +612,16 @@ plt.xlabel("частота модуляции g, циклы/отсчёт")
 plt.ylabel("АЧХ, дБ")
 plt.title("Амплитудно-частотная характеристика")
 plt.grid(True, which="both")
-plt.savefig("amplitude_kalman4params.png")
-
+plt.savefig("amplitude_kalman5params.png")
+ 
 plt.figure()
 plt.semilogx(freqs, np.unwrap(np.angle(H))*180/np.pi)
 plt.xlabel("частота модуляции g, циклы/отсчёт")
 plt.ylabel("ФЧХ, град")
 plt.title("Фазо-частотная характеристика")
 plt.grid(True, which="both")
-plt.savefig("phase_kalman4params.png")
+plt.savefig("phase_kalman5params.png")
+
 
 
 
