@@ -34,6 +34,50 @@ def init_values(alp, P_exp, poi):
 
     return A0, B0, ph0, pcov, sigma_A
 
+def init_values_linear(alp, P_exp, poi, T):
+    """
+    Линейный аналог init_values. Возвращает то же самое: A0, B0, ph0,
+    приближённую ковариацию pcov (3x3, в параметризации [A, B, ph],
+    получена через линейную МНК + перенос ошибок Якобианом (C,D)->(B,ph)),
+    и sigma_A.
+    """
+ 
+    x = alp[:poi]
+    y = P_exp[:poi]
+ 
+    Phi = 2 * np.pi * x * T**2
+    c = np.cos(Phi)
+    s = np.sin(Phi)
+    M = np.stack([np.ones_like(c), -c, -s], axis=-1)     # (poi, 3)
+ 
+    # линейная МНК
+    params, *_ = np.linalg.lstsq(M, y, rcond=None)
+    A0, C0, D0 = params
+ 
+    B0 = np.sqrt(C0**2 + D0**2)
+    ph0 = np.arctan2(D0, C0)
+ 
+    resid = y - (A0 - C0 * c - D0 * s)
+    sigma_A = np.std(resid)
+ 
+    # ковариация [A, C, D] -> перенос в [A, B, ph] через Якобиан
+    dof = max(len(y) - 3, 1)
+    var_resid = np.sum(resid**2) / dof
+    MtM_inv = np.linalg.inv(M.T @ M)
+    cov_ACD = MtM_inv * var_resid
+ 
+    if B0 > 1e-12:
+        J = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, C0 / B0, D0 / B0],
+            [0.0, -D0 / B0**2, C0 / B0**2],
+        ])
+    else:
+        J = np.eye(3)
+ 
+    pcov = J @ cov_ACD @ J.T
+ 
+    return A0, B0, ph0, pcov, sigma_A
 
 def Hx(x, alpha, T):
 
@@ -64,7 +108,7 @@ def HJacobian(x, alpha, T):
     return H
 
 
-def kalmanFit_EKF(alp, P_exp, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0, v_ph0, a_ph00):
+def kalmanFit_EKF(alp, P_exp, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0, v_ph0, a_ph0):
 
     N = len(alp)
 
@@ -175,51 +219,54 @@ def kalmanFit_EKF(alp, P_exp, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0, v_ph
 
     return P_m, A, B, ph, v_ph, a_ph, P_cov, e, en
 
-def windowFit(alp, P_exp, T, window):
-
+def windowFit(alp, P_exp, T, window, step):
+ 
     lm=780e-9
     N = len(alp)
-
+ 
     keff = 4*np.pi/lm
-
+ 
     # результаты
     g = np.full(N, np.nan)
     A_fit = np.full(N, np.nan)
     B_fit = np.full(N, np.nan)
     ph_fit = np.full(N, np.nan)
-
+ 
     # половина окна
     half = window // 2
-
-    for i in range(half, N-half):
-
+ 
+    # step — на сколько отсчётов сдвигается центр окна между соседними
+    # фитами (т.е. сколько точек "отрезается"/пропускается на каждом шаге).
+    # step=1 воспроизводит прежнее поведение (фит на каждом отсчёте).
+    for i in range(half, N-half, step):
+ 
         # -----------------------------------------
         # текущее окно
         # -----------------------------------------
-
+ 
         sl = slice(i-half, i+half+1)
-
+ 
         x = alp[sl]
         y = P_exp[sl]
-
+ 
         # -----------------------------------------
         # начальные значения
         # -----------------------------------------
-
+ 
         A0 = (np.max(y) + np.min(y)) / 2
         B0 = (np.max(y) - np.min(y)) / 2
-
+ 
         # начальная оценка фазы
         idx_min = np.argmin(y)
-
+ 
         phi0 = 2*np.pi*x[idx_min]*T**2
-
+ 
         # -----------------------------------------
         # fit
         # -----------------------------------------
-
+ 
         try:
-
+ 
             popt, pcov = curve_fit(
                 model,
                 x,
@@ -231,41 +278,113 @@ def windowFit(alp, P_exp, T, window):
                 ),
                 maxfev=10000
             )
-
+ 
             Ai, Bi, phi = popt
-
+ 
             # -----------------------------------------
             # выбор правильной ветви фазы
             # -----------------------------------------
-
+ 
             phi_target = 2*np.pi*x[idx_min]*T**2
-
+ 
             M = np.round(
                 (phi_target - phi)/(2*np.pi)
             )
-
+ 
             phi = phi + 2*np.pi*M
-
+ 
             # -----------------------------------------
             # вычисление g
             # -----------------------------------------
-
+ 
             gi = phi/(keff*T**2)
-
+ 
             # -----------------------------------------
             # сохранение результата
             # -----------------------------------------
-
+ 
             g[i] = gi
             A_fit[i] = Ai
             B_fit[i] = Bi
             ph_fit[i] = phi
-
+ 
         except (RuntimeError, ValueError):
             pass
-
+ 
     return g
 
+def windowFit_linear(alp, P_exp, T, window, step=1):
+    """
+    Быстрый аналог windowFit: та же логика (скользящее окно + оценка g),
+    но фит внутри каждого окна линейный (квадратурное разложение), а
+    все окна считаются одним батчем через np.linalg.solve, без Python
+    цикла по окнам и без curve_fit.
+    """
+ 
+    lm = 780e-9
+    keff = 4 * np.pi / lm
+    N = len(alp)
+    half = window // 2
+ 
+    g = np.full(N, np.nan)
+ 
+    centers = np.arange(half, N - half, step)
+    if len(centers) == 0:
+        return g
+ 
+    # индексы всех окон сразу: (K, window)
+    idx = centers[:, None] + np.arange(-half, half + 1)[None, :]
+    x = alp[idx]          # (K, window)
+    y = P_exp[idx]         # (K, window)
+ 
+    Phi = 2 * np.pi * x * T**2
+    c = np.cos(Phi)
+    s = np.sin(Phi)
+    ones = np.ones_like(c)
+ 
+    # design matrix: model = A - C*cos(Phi) - D*sin(Phi)
+    Mrows = np.stack([ones, -c, -s], axis=-1)          # (K, window, 3)
+ 
+    MtM = np.einsum('kwi,kwj->kij', Mrows, Mrows)        # (K, 3, 3)
+    Mty = np.einsum('kwi,kw->ki', Mrows, y)[..., None]    # (K, 3, 1) -- нужна доп. ось,
+                                                           # иначе np.linalg.solve батчево
+                                                           # трактует (K,3) как core-размерности,
+                                                           # а не (batch, m)
+ 
+    params = np.full((len(centers), 3), np.nan)
+    try:
+        params = np.linalg.solve(MtM, Mty)[..., 0]        # (K, 3) -> [A, C, D]
+    except np.linalg.LinAlgError:
+        # если какие-то окна вырождены (крайне маловероятно) -- добираем
+        # их поштучно через lstsq, остальное остаётся векторизованным
+        Mty2 = Mty[..., 0]
+        for k in range(len(centers)):
+            try:
+                params[k] = np.linalg.solve(MtM[k], Mty2[k])
+            except np.linalg.LinAlgError:
+                try:
+                    params[k] = np.linalg.lstsq(Mrows[k], y[k], rcond=None)[0]
+                except np.linalg.LinAlgError:
+                    pass
+ 
+    A_k = params[:, 0]
+    C_k = params[:, 1]
+    D_k = params[:, 2]
+ 
+    B_k = np.sqrt(C_k**2 + D_k**2)
+    phi_k = np.arctan2(D_k, C_k)
+ 
+    # выбор правильной ветви фазы -- как в оригинале
+    idx_min = np.argmin(y, axis=1)
+    x_min = x[np.arange(len(centers)), idx_min]
+    phi_target = 2 * np.pi * x_min * T**2
+    Mbr = np.round((phi_target - phi_k) / (2 * np.pi))
+    phi_k = phi_k + 2 * np.pi * Mbr
+ 
+    g_k = phi_k / (keff * T**2)
+ 
+    g[centers] = g_k
+    return g
 
 
 def kalmanGraphs(alp, P_exp, A, B, ph, v_ph, P_cov, e, en):
@@ -304,7 +423,7 @@ def kalmanGraphs(alp, P_exp, A, B, ph, v_ph, P_cov, e, en):
 
     # comparison
     axs[2].plot(g_sim*1e5, label="simulation")
-    g_window = windowFit(alp, P_exp, T, 20)
+    g_window = windowFit(alp, P_exp, T, 20, 1)
     axs[2].plot(g_window*1e5, label="window")
     # --- Savitzky-Golay для сравнения ---
     # окно должно быть нечётным и меньше длины массива
@@ -482,9 +601,8 @@ sim_params = dict(
     dv_ph_sim=dv_ph_sim,
     sigma_A_sim=sigma_A_sim,
 )
-
-
-
+ 
+ 
 def simulate_data(f_mod, N, params, seed=None):
     """
     Генерирует alp / g_sim / ph_sim / v_ph_sim / a_ph_sim / P_sim_noise по
@@ -533,21 +651,72 @@ def simulate_data(f_mod, N, params, seed=None):
     return alp, g_sim, ph_sim, v_ph_sim, a_ph_sim, P_sim_noise
  
  
-def simulate_and_track(f_mod, N=1000, params=sim_params, poi=poi, seed=None):
-    """f_mod: частота модуляции g, циклы/отсчёт (i — псевдо-время).
-    Все параметры модели/симуляции и способ построения Q/P_cov0 — те же,
-    что и в основном блоке скрипта выше (никаких отдельных копий чисел)."""
+# --------------------------------------------------------------------
+# Универсальный расчёт АЧХ/ФЧХ для произвольного метода оценки g.
+#
+# "Трекер" — это функция вида
+#
+#     tracker(f_mod, sim, params) -> g_est
+#
+# где sim = (alp, g_sim, ph_sim, v_ph_sim, a_ph_sim, P_sim_noise) — то,
+# что вернул simulate_data для этой реализации шума. g_est может
+# содержать NaN там, где метод не даёт оценку (например, края окна в
+# windowFit) — они линейно интерполируются перед расчётом Фурье-
+# коэффициента, чтобы это не мешало усреднению по частоте.
+#
+# Чтобы добавить ФЧХ калмана без производной (3 состояния) или с одной
+# производной (4 состояния) — не нужно трогать freq_point_generic,
+# windowFit, savgolFilter или графики: достаточно написать свой tracker
+# с такой же сигнатурой (взяв за образец kalman_tracker ниже, но со
+# своими Q/P_cov0/kalmanFit_EKF) и передать его в freq_point_generic.
+# --------------------------------------------------------------------
  
+def _interp_nans(x):
+    """Линейно интерполирует NaN внутри массива (нужно для методов вроде
+    windowFit, которые не дают оценку на каждом отсчёте)."""
+    x = x.copy()
+    idx = np.arange(len(x))
+    valid = np.isfinite(x)
+    if valid.sum() < 2:
+        return x
+    x[~valid] = np.interp(idx[~valid], idx[valid], x[valid])
+    return x
+ 
+ 
+def freq_point_generic(f_mod, tracker, N=2000, n_skip=200, n_avg=3, params=sim_params):
+    """Комплексный коэффициент передачи H(f) = out/in на частоте f_mod
+    для произвольного tracker(f_mod, sim, params) -> g_est."""
+    t = np.arange(N)[n_skip:]
+    window = np.hanning(len(t))
+ 
+    Hs = []
+    for k in range(n_avg):
+        sim = simulate_data(f_mod, N, params, seed=k)
+        alp, g_sim, ph_sim, v_ph_sim, a_ph_sim, P_sim_noise = sim
+ 
+        g_est = _interp_nans(tracker(f_mod, sim, params))
+ 
+        x_in  = (g_sim[n_skip:] - np.mean(g_sim[n_skip:])) * window
+        x_out = (g_est[n_skip:] - np.mean(g_est[n_skip:])) * window
+ 
+        c_in  = np.sum(x_in  * np.exp(-1j*2*np.pi*f_mod*t))
+        c_out = np.sum(x_out * np.exp(-1j*2*np.pi*f_mod*t))
+ 
+        Hs.append(c_out/c_in)
+ 
+    return np.mean(Hs)
+ 
+ 
+# ---------------------------- трекеры ----------------------------------
+ 
+def kalman_tracker(f_mod, sim, params, poi=poi):
+    """Оценка g через EKF (A, B, ph, v_ph, a_ph) — та же логика Q/P_cov0,
+    что и в основном блоке скрипта выше."""
+    alp, g_sim, ph_sim, v_ph_sim, a_ph_sim, P_sim_noise = sim
     T = params['T']
     keff = params['keff']
     Dg = params['Dg']
  
-    alp, g_sim, ph_sim, v_ph_sim, a_ph_sim, P_sim_noise = simulate_data(f_mod, N, params, seed=seed)
- 
-    # Q строится в точности как выше: dA_model/dB_model из параметров
-    # симуляции, dv_ph_model берётся готовым из params (та же логика,
-    # что и в основном блоке), da_ph_model — по той же эмпирической
-    # формуле std() приращений.
     dA_model = np.sqrt(params['DA_sim']**2 + params['dA_sim']**2)
     dB_model = params['dB_sim']
     dph_model = np.sqrt(params['dph_sim']**2)
@@ -556,12 +725,10 @@ def simulate_and_track(f_mod, N=1000, params=sim_params, poi=poi, seed=None):
     Q = np.diag([dA_model**2, dB_model**2, dph_model**2, dv_ph_model**2, da_ph_model**2])
  
     sigma_ph = params['sigma_ph_vibr']
-    A0, B0, ph0, P_cov_3d, sigma_A = init_values(alp, P_sim_noise, poi)
+    A0, B0, ph0, P_cov_3d, sigma_A = init_values_linear(alp, P_sim_noise, poi, T)
     v_ph0 = Dg*2*np.pi*f_mod*keff*T*T
     a_ph0 = 0
  
-    # P_cov0 собирается так же, как выше: 3x3 блок из init_values,
-    # плюс отдельные дисперсии для v_ph и a_ph.
     P_cov0 = np.zeros((5, 5))
     for a in range(3):
         for b in range(3):
@@ -575,51 +742,139 @@ def simulate_and_track(f_mod, N=1000, params=sim_params, poi=poi, seed=None):
         alp, P_sim_noise, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0, v_ph0, a_ph0
     )
  
-    g_kalman = ph/keff/T**2  # непрерывная величина, развёртка веток не нужна
-    return g_sim, g_kalman
+    return ph/keff/T**2  # непрерывная величина, развёртка веток не нужна
  
  
-def freq_point(f_mod, N=2000, n_skip=200, n_avg=3, params=sim_params):
-    """Комплексный коэффициент передачи H(f) = out/in на частоте f_mod."""
+def savgolFilter(g_in, window_length, polyorder):
+    """Savitzky-Golay по валидным (не NaN) точкам входного сигнала — как в
+    kalmanGraphs, но вынесено в функцию с настраиваемыми параметрами
+    фильтра. Точки, где фильтр применить нельзя (NaN на входе, либо
+    валидных точек меньше window_length), остаются NaN."""
+    g_out = np.full_like(g_in, np.nan)
+    valid = np.isfinite(g_in)
+    if np.sum(valid) >= window_length:
+        g_out[valid] = savgol_filter(g_in[valid], window_length=window_length, polyorder=polyorder)
+    return g_out
+ 
+ 
+def make_window_tracker(window, step):
+    """window — размер окна windowFit, step — сколько отсчётов
+    пропускается между соседними окнами (см. windowFit). Оставлено для
+    случаев, когда нужен только один канал — если нужны сразу window И
+    savgol, используйте multi_tracker ниже, чтобы не считать windowFit
+    дважды."""
+    def tracker(f_mod, sim, params):
+        alp, g_sim, ph_sim, v_ph_sim, a_ph_sim, P_sim_noise = sim
+        return windowFit_linear(alp, P_sim_noise, params['T'], window=window, step=step)
+    return tracker
+ 
+ 
+def make_savgol_tracker(window, step, savgol_window_length, savgol_polyorder):
+    """Сначала windowFit(window, step), затем Savitzky-Golay поверх него.
+    Как и make_window_tracker — самостоятельный трекер для одного канала;
+    при совместном расчёте window+savgol используйте multi_tracker."""
+    def tracker(f_mod, sim, params):
+        alp, g_sim, ph_sim, v_ph_sim, a_ph_sim, P_sim_noise = sim
+        g_window = windowFit_linear(alp, P_sim_noise, params['T'], window=window, step=step)
+        return savgolFilter(g_window, savgol_window_length, savgol_polyorder)
+    return tracker
+ 
+ 
+def make_multi_tracker(poi, window, step, savgol_window_length, savgol_polyorder):
+    """Считает kalman, window и savgol ЗА ОДИН ПРОХОД на каждый (f_mod, seed):
+    - simulate_data вызывается один раз (а не по разу на каждый из трёх
+      трекеров, как было бы при трёх отдельных freq_point_generic);
+    - windowFit вызывается один раз, savgol строится поверх готового
+      результата, а не пересчитывает окна заново.
+    Это и есть основная причина ускорения — раньше окно фитировалось
+    дважды (для window и для savgol), а данные симуляции генерировались
+    трижды (по разу на каждый канал)."""
+    def tracker(f_mod, sim, params):
+        alp, g_sim, ph_sim, v_ph_sim, a_ph_sim, P_sim_noise = sim
+ 
+        g_kalman = kalman_tracker(f_mod, sim, params, poi=poi)
+        g_window = windowFit_linear(alp, P_sim_noise, params['T'], window=window, step=step)
+        g_savgol = savgolFilter(g_window, savgol_window_length, savgol_polyorder)
+ 
+        return {'kalman': g_kalman, 'window': g_window, 'savgol': g_savgol}
+    return tracker
+ 
+ 
+def freq_point_multi(f_mod, tracker, channels, N=2000, n_skip=200, n_avg=3, params=sim_params):
+    """Как freq_point_generic, но tracker(f_mod, sim, params) возвращает
+    словарь {имя_канала: g_est}, и H считается сразу для всех channels —
+    simulate_data и любые общие промежуточные расчёты (например,
+    windowFit внутри multi_tracker) выполняются один раз на seed, а не
+    по разу на каждый канал."""
     t = np.arange(N)[n_skip:]
     window = np.hanning(len(t))
  
-    Hs = []
+    Hs = {ch: [] for ch in channels}
     for k in range(n_avg):
-        g_sim, g_kalman = simulate_and_track(f_mod, N=N, params=params, seed=k)
+        sim = simulate_data(f_mod, N, params, seed=k)
+        alp, g_sim, ph_sim, v_ph_sim, a_ph_sim, P_sim_noise = sim
  
-        x_in  = (g_sim[n_skip:]    - np.mean(g_sim[n_skip:]))    * window
-        x_out = (g_kalman[n_skip:] - np.mean(g_kalman[n_skip:])) * window
+        g_ests = tracker(f_mod, sim, params)
  
-        c_in  = np.sum(x_in  * np.exp(-1j*2*np.pi*f_mod*t))
-        c_out = np.sum(x_out * np.exp(-1j*2*np.pi*f_mod*t))
+        x_in = (g_sim[n_skip:] - np.mean(g_sim[n_skip:])) * window
+        c_in = np.sum(x_in * np.exp(-1j*2*np.pi*f_mod*t))
  
-        Hs.append(c_out/c_in)
+        for ch in channels:
+            g_est = _interp_nans(g_ests[ch])
+            x_out = (g_est[n_skip:] - np.mean(g_est[n_skip:])) * window
+            c_out = np.sum(x_out * np.exp(-1j*2*np.pi*f_mod*t))
+            Hs[ch].append(c_out/c_in)
  
-    return np.mean(Hs)
+    return {ch: np.mean(vals) for ch, vals in Hs.items()}
  
  
 # ---- свип по частоте и построение АЧХ/ФЧХ ----
  
+# настройки фильтров windowFit / savgol — здесь и только здесь
+WINDOW = 20              # размер окна windowFit
+WINDOW_STEP = 1         # шаг между соседними окнами (сколько отсчётов "отрезается" за раз);
+                         # увеличивайте, если расчёт всё ещё медленный — на ФЧХ почти не влияет,
+                         # т.к. нас интересует только одна спектральная компонента на f_mod
+SAVGOL_WINDOW_LENGTH = 21
+SAVGOL_POLYORDER = 3
+ 
+multi_tracker = make_multi_tracker(poi, WINDOW, WINDOW_STEP, SAVGOL_WINDOW_LENGTH, SAVGOL_POLYORDER)
+ 
 freqs = np.logspace(-5, np.log10(0.3), 200)   # циклы/отсчёт, до ~Найквиста (0.5)
-H = np.array([freq_point(f) for f in freqs])
+ 
+channels = ['kalman', 'window', 'savgol']
+H_by_channel = {ch: np.zeros(len(freqs), dtype=complex) for ch in channels}
+for idx, f_mod in enumerate(freqs):
+    Hs = freq_point_multi(f_mod, multi_tracker, channels)
+    for ch in channels:
+        H_by_channel[ch][idx] = Hs[ch]
+ 
+H_kalman = H_by_channel['kalman']
+H_window = H_by_channel['window']
+H_savgol = H_by_channel['savgol']
  
 T_rep = 200e-3
  
 plt.figure()
-plt.semilogx(freqs, 20*np.log10(np.abs(H)))
+plt.semilogx(freqs, 20*np.log10(np.abs(H_kalman)), label="kalman")
+plt.semilogx(freqs, 20*np.log10(np.abs(H_window)), label="window")
+plt.semilogx(freqs, 20*np.log10(np.abs(H_savgol)), label="savgol")
 plt.xlabel("частота модуляции g, циклы/отсчёт")
 plt.ylabel("АЧХ, дБ")
 plt.title("Амплитудно-частотная характеристика")
 plt.grid(True, which="both")
+plt.legend()
 plt.savefig("amplitude_kalman5params.png")
  
 plt.figure()
-plt.semilogx(freqs, np.unwrap(np.angle(H))*180/np.pi)
+plt.semilogx(freqs, np.unwrap(np.angle(H_kalman))*180/np.pi, label="kalman")
+plt.semilogx(freqs, np.unwrap(np.angle(H_window))*180/np.pi, label="window")
+plt.semilogx(freqs, np.unwrap(np.angle(H_savgol))*180/np.pi, label="savgol")
 plt.xlabel("частота модуляции g, циклы/отсчёт")
 plt.ylabel("ФЧХ, град")
 plt.title("Фазо-частотная характеристика")
 plt.grid(True, which="both")
+plt.legend()
 plt.savefig("phase_kalman5params.png")
 
 
