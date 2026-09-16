@@ -373,13 +373,13 @@ def kalmanGraphs(alp, P_exp, A, B, ph, P_cov, e, en):
     axs[0].plot(A, label="kalman")
     axs[0].plot(A_sim, label="simulation")
     axs[0].set_title('A')
-    plt.legend()
+    axs[0].legend()
 
     # Второй график
     axs[1].plot(B, label="kalman")
     axs[1].plot(B_sim, label="simulation")
     axs[1].set_title('B')
-    plt.legend()
+    axs[1].legend()
 
     # Третий график
     lm = 780e-9
@@ -395,11 +395,11 @@ def kalmanGraphs(alp, P_exp, A, B, ph, P_cov, e, en):
 
     # comparison
     axs[2].plot(g_sim*1e5, label="simulation")
-    g_window = windowFit(alp, P_exp, T, 20)
+    g_window = windowFit(alp, P_exp, T, 201)
     axs[2].plot(g_window*1e5, label="window")
     # --- Savitzky-Golay для сравнения ---
     # окно должно быть нечётным и меньше длины массива
-    window_length = 21          # можно менять (11, 21, 51, 101...)
+    window_length = 201          # можно менять (11, 21, 51, 101...)
     polyorder = 3
 
     # для исправления nan
@@ -416,7 +416,7 @@ def kalmanGraphs(alp, P_exp, A, B, ph, P_cov, e, en):
     axs[2].plot(g_savgol*1e5, label="savgol")
 
     axs[2].set_title(r'$g$')
-    plt.legend()
+    axs[2].legend()
 
     
     # uncerteinty 
@@ -437,7 +437,7 @@ def kalmanGraphs(alp, P_exp, A, B, ph, P_cov, e, en):
     axss[2].plot((g_window - g_sim)*1e5, label='window diff')
     axss[2].plot((g_savgol - g_sim)*1e5, label='savgol_diff')
     axss[2].set_title('$dg$')
-    plt.legend()
+    axss[2].legend()
 
     # Q finder
     # plt.figure()
@@ -462,51 +462,53 @@ P_exp = data[1]
 
 # smimulation data
 N_sim = 1000
-f = 1/200
+f = 1e-5
 
 g0 = 9.8101507
 Dg = 300*1e-8
 g_sim = np.zeros(N_sim)
-
+g_sim[-1] = g0
 
 alp_min = keff*g0/2/np.pi - 1/5/T/T
 alp_max = keff*g0/2/np.pi + 1/5/T/T
 alp_amount = 20
 alp_start = np.linspace(alp_min, alp_max, alp_amount)
-alp = np.zeros(1000)
+alp = np.zeros(N_sim)
 
 
 
 
 
-Ph = np.zeros(len(alp))
-F_vib = np.zeros(len(alp))
+Ph = np.zeros(N_sim)
+F_vib = np.zeros(N_sim)
 sigma_ph_vibr = 1e-4
 
-A_sim = np.zeros(len(alp))
+A_sim = np.zeros(N_sim)
 A0_sim = 0.15
-dA_sim = 1e-3*0
-DA_sim = 3e-5
+A_sim[-1] = A0_sim
+dA_sim = 1e-4
+DA_sim = 3e-5*0
 
-B_sim = np.zeros(len(alp))
+B_sim = np.zeros(N_sim)
 B0_sim = 0.21
-dB_sim = 1e-3*0
+B_sim[-1] = B0_sim
+dB_sim = 1e-4
 
-ph_sim = np.zeros(len(alp))
-dph_sim = 1e-4*0
+ph_sim = np.zeros(N_sim)
+dph_sim = 1e-6
 Dph_sim = Dg*2*np.pi*f*(1 - np.cos(2*np.pi*f))*keff*T*T
 
-P_sim = np.zeros(len(alp))
-P_sim_noise = np.zeros(len(alp))
-sigma_A_sim = 1e-3
+P_sim = np.zeros(N_sim)
+P_sim_noise = np.zeros(N_sim)
+sigma_A_sim = 3e-3
 
-for i in range(len(alp)):
-    g_sim[i] = g0 + Dg*np.sin(2*np.pi*f*i)
+for i in range(N_sim):
+    g_sim[i] = g0*0 + Dg*np.sin(2*np.pi*f*i)*0 + g_sim[i-1] + np.random.normal(0, dph_sim)/keff/T/T
     F_vib[i] = np.random.uniform(-np.pi/12, np.pi/12)
     alp[i] = alp_start[i%alp_amount] - F_vib[i]/2/np.pi/T/T
-    A_sim[i] = A0_sim + DA_sim*i + np.random.normal(0, dA_sim)
-    B_sim[i] = B0_sim + np.random.normal(0, dB_sim)
-    ph_sim[i] = keff*g_sim[i]*T*T + np.random.normal(0, dph_sim)
+    A_sim[i] = A_sim[i-1] + DA_sim + np.random.normal(0, dA_sim)
+    B_sim[i] = B_sim[i-1] + np.random.normal(0, dB_sim)
+    ph_sim[i] = keff*g_sim[i]*T*T
     Ph[i] = 2*np.pi*alp[i]*T*T - ph_sim[i]
     P_sim[i] = A_sim[i] - B_sim[i]*np.cos(Ph[i])
     F_vib[i] += np.random.normal(0, sigma_ph_vibr)
@@ -524,7 +526,7 @@ for i in range(len(alp)):
 
 dA_model = np.sqrt(DA_sim**2 + dA_sim**2)
 dB_model = dB_sim
-dph_model = np.std(ph_sim[1:] - np.roll(ph_sim, 1)[1:]) * 2# np.sqrt(dph_sim**2 + Dph_sim**2)
+dph_model = dph_sim #np.std(ph_sim[1:] - np.roll(ph_sim, 1)[1:]) * 2# np.sqrt(dph_sim**2 + Dph_sim**2)
 Q = np.diag([dA_model**2, dB_model**2, dph_model**2])
 
 # initial values
@@ -535,7 +537,7 @@ sigma_A = sigma_A_sim # only for sim
 P_m, A, B, ph, P_cov, e, en = kalmanFit_EKF(alp, P_sim_noise, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0)
 
 
-#kalmanGraphs(alp, P_sim_noise, A, B, ph, P_cov, e, en)
+kalmanGraphs(alp, P_sim_noise, A, B, ph, P_cov, e, en)
 
 
 
@@ -689,57 +691,57 @@ def freq_point_multi(f_mod, tracker, channels,
 
 # -------------------- свип по частоте --------------------
 
-WINDOW = 20
-WINDOW_STEP = 1          # можно 2–5 для ускорения
-SAVGOL_WINDOW_LENGTH = 21
-SAVGOL_POLYORDER = 3
+# WINDOW = 20
+# WINDOW_STEP = 1          # можно 2–5 для ускорения
+# SAVGOL_WINDOW_LENGTH = 21
+# SAVGOL_POLYORDER = 3
 
-multi_tracker = make_multi_tracker(poi, WINDOW, WINDOW_STEP,
-                                   SAVGOL_WINDOW_LENGTH, SAVGOL_POLYORDER)
+# multi_tracker = make_multi_tracker(poi, WINDOW, WINDOW_STEP,
+#                                    SAVGOL_WINDOW_LENGTH, SAVGOL_POLYORDER)
 
-freqs = np.logspace(-5, np.log10(0.3), 150)
+# freqs = np.logspace(-5, np.log10(0.3), 150)
 
-channels = ['kalman', 'window', 'savgol']
-H_by_channel = {ch: np.zeros(len(freqs), dtype=complex) for ch in channels}
+# channels = ['kalman', 'window', 'savgol']
+# H_by_channel = {ch: np.zeros(len(freqs), dtype=complex) for ch in channels}
 
-for idx, f_mod in enumerate(freqs):
-    Hs = freq_point_multi(f_mod, multi_tracker, channels)
-    for ch in channels:
-        H_by_channel[ch][idx] = Hs[ch]
+# for idx, f_mod in enumerate(freqs):
+#     Hs = freq_point_multi(f_mod, multi_tracker, channels)
+#     for ch in channels:
+#         H_by_channel[ch][idx] = Hs[ch]
 
-H_kalman = H_by_channel['kalman']
-H_window = H_by_channel['window']
-H_savgol = H_by_channel['savgol']
+# H_kalman = H_by_channel['kalman']
+# H_window = H_by_channel['window']
+# H_savgol = H_by_channel['savgol']
 
-# -------------------- графики --------------------
+# # -------------------- графики --------------------
 
-plt.figure(figsize=(9, 5))
-plt.semilogx(freqs, 20*np.log10(np.abs(H_kalman)), label="kalman")
-plt.semilogx(freqs, 20*np.log10(np.abs(H_window)), label="window")
-plt.semilogx(freqs, 20*np.log10(np.abs(H_savgol)), label="savgol")
-plt.xlabel("частота модуляции g, циклы/отсчёт")
-plt.ylabel("АЧХ, дБ")
-plt.title("Амплитудно-частотная характеристика (Kalman 3 states)")
-plt.grid(True, which="both")
-plt.legend()
-plt.tight_layout()
-plt.savefig("amplitude_kalman3params.png", dpi=150)
+# plt.figure(figsize=(9, 5))
+# plt.semilogx(freqs, 20*np.log10(np.abs(H_kalman)), label="kalman")
+# plt.semilogx(freqs, 20*np.log10(np.abs(H_window)), label="window")
+# plt.semilogx(freqs, 20*np.log10(np.abs(H_savgol)), label="savgol")
+# plt.xlabel("частота модуляции g, циклы/отсчёт")
+# plt.ylabel("АЧХ, дБ")
+# plt.title("Амплитудно-частотная характеристика (Kalman 3 states)")
+# plt.grid(True, which="both")
+# plt.legend()
+# plt.tight_layout()
+# plt.savefig("amplitude_kalman3params.png", dpi=150)
 
-plt.figure(figsize=(9, 5))
-plt.semilogx(freqs, np.unwrap(np.angle(H_kalman))*180/np.pi, label="kalman")
-plt.semilogx(freqs, np.unwrap(np.angle(H_window))*180/np.pi, label="window")
-plt.semilogx(freqs, np.unwrap(np.angle(H_savgol))*180/np.pi, label="savgol")
-plt.xlabel("частота модуляции g, циклы/отсчёт")
-plt.ylabel("ФЧХ, град")
-plt.title("Фазо-частотная характеристика (Kalman 3 states)")
-plt.grid(True, which="both")
-plt.legend()
-plt.tight_layout()
-plt.savefig("phase_kalman3params.png", dpi=150)
-
-plt.show()
-
+# plt.figure(figsize=(9, 5))
+# plt.semilogx(freqs, np.unwrap(np.angle(H_kalman))*180/np.pi, label="kalman")
+# plt.semilogx(freqs, np.unwrap(np.angle(H_window))*180/np.pi, label="window")
+# plt.semilogx(freqs, np.unwrap(np.angle(H_savgol))*180/np.pi, label="savgol")
+# plt.xlabel("частота модуляции g, циклы/отсчёт")
+# plt.ylabel("ФЧХ, град")
+# plt.title("Фазо-частотная характеристика (Kalman 3 states)")
+# plt.grid(True, which="both")
+# plt.legend()
+# plt.tight_layout()
+# plt.savefig("phase_kalman3params.png", dpi=150)
 
 plt.show()
+
+
+
 
 
