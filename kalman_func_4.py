@@ -545,7 +545,7 @@ f = 2e-4
 g0 = 9.8101507
 Dg = 300*1e-8
 g_sim = np.zeros(N_sim)
-g_sim[0] = g0
+g_sim[-1] = g0
 
 alp_min = keff*g0/2/np.pi - 1/1.6/T/T
 alp_max = keff*g0/2/np.pi + 1/1.6/T/T
@@ -560,26 +560,30 @@ sigma_ph_vibr = 1e-4
 
 A_sim = np.zeros(N_sim)
 A0_sim = 0.15
-dA_sim = 1e-3*0
-DA_sim = 3e-5
+A_sim[-1] = A0_sim
+dA_sim = 1e-4
+DA_sim = 3e-5*0
+
 
 B_sim = np.zeros(N_sim)
 B0_sim = 0.21
-dB_sim = 1e-3*0
+B0_sim = 0.21
+B_sim[-1] = B0_sim
+dB_sim = 1e-4
 
 ph_sim = np.zeros(N_sim)
 dph_sim = 1e-4*0
 v_ph_sim = np.zeros(N_sim)
-dv_ph_sim = Dg*2*np.pi*f*(1 - np.cos(2*np.pi*f))*keff*T*T/25
+dv_ph_sim =  1e-6# Dg*2*np.pi*f*(1 - np.cos(2*np.pi*f))*keff*T*T/25
 
 P_sim = np.zeros(N_sim)
 P_sim_noise = np.zeros(N_sim)
-sigma_A_sim = 1e-3
+sigma_A_sim = 3e-3
 
 
 for i in range(len(alp)):
-    g_sim[i] = g_sim[i-1] + Dg*np.sin(2*np.pi*f*i)*0 + g0*0 + np.random.normal(0, dph_sim)/keff/T/T
-    v_ph_sim[i] = Dg*2*np.pi*f*np.cos(2*np.pi*f*i)*keff*T**2
+    g_sim[i] = g_sim[i-1] + Dg*np.sin(2*np.pi*f*i)*0 + g0*0 + np.random.normal(0, dph_sim)/keff/T/T*0
+    v_ph_sim[i] = Dg*2*np.pi*f*np.cos(2*np.pi*f*i)*keff*T**2*0 + np.random.normal(0, dv_ph_sim)
     F_vib[i] = np.random.uniform(-np.pi/12, np.pi/12)
     alp[i] = alp_start[i%alp_amount] - F_vib[i]/2/np.pi/T/T
     A_sim[i] = A0_sim + DA_sim*i + np.random.normal(0, dA_sim)
@@ -598,7 +602,7 @@ dA_model = np.sqrt(DA_sim**2 + dA_sim**2)
 dB_model = dB_sim
 
 dph_model = np.sqrt(dph_sim**2)
-dv_ph_model = np.std(v_ph_sim[1:] - np.roll(v_ph_sim, 1)[1:]) * 2 # dv_ph_sim
+dv_ph_model = dv_ph_sim # np.std(v_ph_sim[1:] - np.roll(v_ph_sim, 1)[1:]) * 2
 Q = np.diag([dA_model**2, dB_model**2, dph_model**2, dv_ph_model**2])
 
 # initial values
