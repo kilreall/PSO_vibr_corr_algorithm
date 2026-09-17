@@ -5,6 +5,9 @@ import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 from filterpy.kalman import ExtendedKalmanFilter
 from scipy.signal import savgol_filter
+from scipy.signal import savgol_coeffs
+
+
 
 def model(alp, A, B, ph):
     return A - B*np.cos(2*np.pi*alp*T**2 - ph)
@@ -214,6 +217,7 @@ def windowFit(alp, P_exp, T, window):
 
     # результаты
     g = np.full(N, np.nan)
+    g_err = np.full(N, np.nan)
     A_fit = np.full(N, np.nan)
     B_fit = np.full(N, np.nan)
     ph_fit = np.full(N, np.nan)
@@ -282,11 +286,14 @@ def windowFit(alp, P_exp, T, window):
 
             gi = phi/(keff*T**2)
 
+            sigma_phi = np.sqrt(pcov[2, 2])
+            gi_err = sigma_phi/(keff*T**2)
             # -----------------------------------------
             # сохранение результата
             # -----------------------------------------
 
             g[i] = gi
+            g_err[i] = gi_err
             A_fit[i] = Ai
             B_fit[i] = Bi
             ph_fit[i] = phi
@@ -294,7 +301,7 @@ def windowFit(alp, P_exp, T, window):
         except (RuntimeError, ValueError):
             pass
 
-    return g
+    return g, g_err
 
 def windowFit_linear(alp, P_exp, T, window, step=1):
     """Быстрый аналог windowFit: линейный (квадратурный) фит внутри
@@ -357,6 +364,7 @@ def windowFit_linear(alp, P_exp, T, window, step=1):
     g[centers] = g_k
     return g
 
+
 def kalmanGraphs(alp, P_exp, A, B, ph, P_cov, e, en):
 
     # main graphic
@@ -395,7 +403,7 @@ def kalmanGraphs(alp, P_exp, A, B, ph, P_cov, e, en):
 
     # comparison
     axs[2].plot(g_sim*1e5, label="simulation")
-    g_window = windowFit(alp, P_exp, T, 201)
+    g_window, g_window_err = windowFit(alp, P_exp, T, 201)
     axs[2].plot(g_window*1e5, label="window")
     # --- Savitzky-Golay для сравнения ---
     # окно должно быть нечётным и меньше длины массива
@@ -405,9 +413,11 @@ def kalmanGraphs(alp, P_exp, A, B, ph, P_cov, e, en):
     # для исправления nan
     valid = np.isfinite(g_window)
     g_savgol = np.full_like(g_window, np.nan)
+
+
     if np.sum(valid) >= window_length:
         g_savgol[valid] = savgol_filter(g_window[valid], window_length=window_length, polyorder=polyorder)
-
+        
 
     #g_savgol = savgol_filter(g_window, window_length=window_length, polyorder=polyorder) # работает в институте
 
@@ -420,7 +430,7 @@ def kalmanGraphs(alp, P_exp, A, B, ph, P_cov, e, en):
 
     
     # uncerteinty 
-    fig1, axss = plt.subplots(1, 3, figsize=(14, 4))
+    fig1, axss = plt.subplots(1, 4, figsize=(14, 4))
     plt.title("Standart deviations")
     axss[0].plot(np.sqrt(P_cov[:, 0, 0]))
     axss[0].set_title('dA')
@@ -430,14 +440,18 @@ def kalmanGraphs(alp, P_exp, A, B, ph, P_cov, e, en):
     axss[1].set_title('dB')
 
     # Третий график
-    lm = 780e-9
-    keff = 4*np.pi/lm
-    #axss[2].plot(np.sqrt(P_cov[:, 2, 2])/keff/T/T*1e5, label="kalman eval")  # или axs[1, 0]
+
     axss[2].plot((g_kalman - g_sim)*1e5, label='kalman diff')
     axss[2].plot((g_window - g_sim)*1e5, label='window diff')
     axss[2].plot((g_savgol - g_sim)*1e5, label='savgol_diff')
-    axss[2].set_title('$dg$')
+    axss[2].set_title(r'$\delta g$')
     axss[2].legend()
+
+    # четвёртый график
+    axss[3].plot(np.sqrt(P_cov[:, 2, 2])/keff/T/T*1e5, label="kalman eval")
+    axss[3].plot(g_window_err*1e5, label="window eval")
+    axss[3].set_title(r'$\sigma_g$')
+    axss[3].legend()
 
     # Q finder
     # plt.figure()
@@ -461,17 +475,22 @@ alp = data[0]*1e6 # 1e6 из-за особенности data
 P_exp = data[1]
 
 # smimulation data
-N_sim = 1000
+N_sim = 10000
 f = 1e-5
 
 g0 = 9.8101507
 Dg = 300*1e-8
 g_sim = np.zeros(N_sim)
 g_sim[-1] = g0
+drift_corr = 3000
+Dg_drift = 30e-8
+theta_drift   = 1 - np.exp(-1.0/drift_corr)
+sigma_g_drift = Dg_drift * np.sqrt(theta_drift*(2 - theta_drift))
+print(f"sigma_g_drift = {sigma_g_drift}")
 
 alp_min = keff*g0/2/np.pi - 1/5/T/T
 alp_max = keff*g0/2/np.pi + 1/5/T/T
-alp_amount = 20
+alp_amount = 201
 alp_start = np.linspace(alp_min, alp_max, alp_amount)
 alp = np.zeros(N_sim)
 
@@ -503,7 +522,7 @@ P_sim_noise = np.zeros(N_sim)
 sigma_A_sim = 3e-3
 
 for i in range(N_sim):
-    g_sim[i] = g0*0 + Dg*np.sin(2*np.pi*f*i)*0 + g_sim[i-1] + np.random.normal(0, dph_sim)/keff/T/T
+    g_sim[i] = g0 + Dg*np.sin(2*np.pi*f*i)*0 + (g_sim[i-1] - g0)*(1 - theta_drift) + sigma_g_drift*np.random.normal()
     F_vib[i] = np.random.uniform(-np.pi/12, np.pi/12)
     alp[i] = alp_start[i%alp_amount] - F_vib[i]/2/np.pi/T/T
     A_sim[i] = A_sim[i-1] + DA_sim + np.random.normal(0, dA_sim)
@@ -526,13 +545,13 @@ for i in range(N_sim):
 
 dA_model = np.sqrt(DA_sim**2 + dA_sim**2)
 dB_model = dB_sim
-dph_model = dph_sim #np.std(ph_sim[1:] - np.roll(ph_sim, 1)[1:]) * 2# np.sqrt(dph_sim**2 + Dph_sim**2)
+dph_model = sigma_g_drift*keff*T*T #np.std(ph_sim[1:] - np.roll(ph_sim, 1)[1:]) * 2# np.sqrt(dph_sim**2 + Dph_sim**2)
 Q = np.diag([dA_model**2, dB_model**2, dph_model**2])
 
 # initial values
-poi = 20
+poi = alp_amount
 A0, B0, ph0, P_cov0, sigma_A = init_values(alp, P_sim_noise, poi)
-sigma_ph = sigma_ph_vibr
+sigma_ph = np.sqrt(sigma_ph_vibr**2 + dph_sim**2*0)
 sigma_A = sigma_A_sim # only for sim
 P_m, A, B, ph, P_cov, e, en = kalmanFit_EKF(alp, P_sim_noise, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0)
 
