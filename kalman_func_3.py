@@ -407,7 +407,7 @@ def kalmanGraphs(alp, P_exp, A, B, ph, P_cov, e, en):
     axs[2].plot(g_window*1e5, label="window")
     # --- Savitzky-Golay для сравнения ---
     # окно должно быть нечётным и меньше длины массива
-    window_length = 201          # можно менять (11, 21, 51, 101...)
+    window_length = 601          # можно менять (11, 21, 51, 101...)
     polyorder = 3
 
     # для исправления nan
@@ -469,89 +469,143 @@ keff = 4*np.pi/lm
 T = 10e-3
 
 
-# experimental data
-data = np.load("data_delay_800.npy")
-alp = data[0]*1e6 # 1e6 из-за особенности data
-P_exp = data[1]
 
-# smimulation data
-N_sim = 10000
-f = 1e-5
+# smimulation functions
+def simul_drift(N_sim, alp_amount):
 
-g0 = 9.8101507
-Dg = 300*1e-8
-g_sim = np.zeros(N_sim)
-g_sim[-1] = g0
-drift_corr = 3000
-Dg_drift = 30e-8
-theta_drift   = 1 - np.exp(-1.0/drift_corr)
-sigma_g_drift = Dg_drift * np.sqrt(theta_drift*(2 - theta_drift))
-print(f"sigma_g_drift = {sigma_g_drift}")
 
-alp_min = keff*g0/2/np.pi - 1/5/T/T
-alp_max = keff*g0/2/np.pi + 1/5/T/T
-alp_amount = 201
-alp_start = np.linspace(alp_min, alp_max, alp_amount)
-alp = np.zeros(N_sim)
+
+    g0 = 9.8101507
+    g_sim = np.zeros(N_sim)
+    g_sim[-1] = g0
+    drift_corr = 3000
+    Dg_drift = 30e-8
+    theta_drift   = 1 - np.exp(-1.0/drift_corr)
+    sigma_g_drift = Dg_drift * np.sqrt(theta_drift*(2 - theta_drift))
+    print(f"sigma_g_drift = {sigma_g_drift}")
+
+    alp_min = keff*g0/2/np.pi - 1/5/T/T
+    alp_max = keff*g0/2/np.pi + 1/5/T/T
+    alp_start = np.linspace(alp_min, alp_max, alp_amount)
+    alp = np.zeros(N_sim)
 
 
 
 
 
-Ph = np.zeros(N_sim)
-F_vib = np.zeros(N_sim)
-sigma_ph_vibr = 1e-4
+    Ph = np.zeros(N_sim)
+    F_vib = np.zeros(N_sim)
+    sigma_ph_vibr = 1e-4
 
-A_sim = np.zeros(N_sim)
-A0_sim = 0.15
-A_sim[-1] = A0_sim
-dA_sim = 1e-4
-DA_sim = 3e-5*0
+    A_sim = np.zeros(N_sim)
+    A0_sim = 0.15
+    A_sim[-1] = A0_sim
+    dA_sim = 1e-4
 
-B_sim = np.zeros(N_sim)
-B0_sim = 0.21
-B_sim[-1] = B0_sim
-dB_sim = 1e-4
+    B_sim = np.zeros(N_sim)
+    B0_sim = 0.21
+    B_sim[-1] = B0_sim
+    dB_sim = 1e-4
 
-ph_sim = np.zeros(N_sim)
-dph_sim = 1e-6
-Dph_sim = Dg*2*np.pi*f*(1 - np.cos(2*np.pi*f))*keff*T*T
+    ph_sim = np.zeros(N_sim)
 
-P_sim = np.zeros(N_sim)
-P_sim_noise = np.zeros(N_sim)
-sigma_A_sim = 3e-3
+    P_sim = np.zeros(N_sim)
+    P_sim_noise = np.zeros(N_sim)
+    sigma_A_sim = 3e-3
 
-for i in range(N_sim):
-    g_sim[i] = g0 + Dg*np.sin(2*np.pi*f*i)*0 + (g_sim[i-1] - g0)*(1 - theta_drift) + sigma_g_drift*np.random.normal()
-    F_vib[i] = np.random.uniform(-np.pi/12, np.pi/12)
-    alp[i] = alp_start[i%alp_amount] - F_vib[i]/2/np.pi/T/T
-    A_sim[i] = A_sim[i-1] + DA_sim + np.random.normal(0, dA_sim)
-    B_sim[i] = B_sim[i-1] + np.random.normal(0, dB_sim)
-    ph_sim[i] = keff*g_sim[i]*T*T
-    Ph[i] = 2*np.pi*alp[i]*T*T - ph_sim[i]
-    P_sim[i] = A_sim[i] - B_sim[i]*np.cos(Ph[i])
-    F_vib[i] += np.random.normal(0, sigma_ph_vibr)
-    alp[i] = alp_start[i%alp_amount] - F_vib[i]/2/np.pi/T/T
-    P_sim_noise[i] = P_sim[i] + np.random.normal(0, sigma_A_sim)
+    for i in range(N_sim):
+        g_sim[i] = g0 + (g_sim[i-1] - g0)*(1 - theta_drift) + sigma_g_drift*np.random.normal()
+        F_vib[i] = np.random.uniform(-np.pi/12, np.pi/12)
+        alp[i] = alp_start[i%alp_amount] - F_vib[i]/2/np.pi/T/T
+        A_sim[i] = A_sim[i-1] + np.random.normal(0, dA_sim)
+        B_sim[i] = B_sim[i-1] + np.random.normal(0, dB_sim)
+        ph_sim[i] = keff*g_sim[i]*T*T
+        Ph[i] = 2*np.pi*alp[i]*T*T - ph_sim[i]
+        P_sim[i] = A_sim[i] - B_sim[i]*np.cos(Ph[i])
+        F_vib[i] += np.random.normal(0, sigma_ph_vibr)
+        alp[i] = alp_start[i%alp_amount] - F_vib[i]/2/np.pi/T/T
+        P_sim_noise[i] = P_sim[i] + np.random.normal(0, sigma_A_sim)
+
+    dph_sim = sigma_g_drift*keff*T*T
+
+    sim_params = 1
+
+    return alp, P_sim_noise, P_sim,  A_sim, B_sim, g_sim, dA_sim, dB_sim, dph_sim, sigma_g_drift, sigma_ph_vibr, sigma_A_sim, sim_params
+
+def simul_sin(N_sim, alp_amount):
+    f = 1e-4
+
+
+    g0 = 9.8101507
+    Dg = 300*1e-8
+    g_sim = np.zeros(N_sim)
+    g_sim[-1] = g0
+
+
+    alp_min = keff*g0/2/np.pi - 1/5/T/T
+    alp_max = keff*g0/2/np.pi + 1/5/T/T
+    alp_start = np.linspace(alp_min, alp_max, alp_amount)
+    alp = np.zeros(N_sim)
+
+
+
+
+
+    Ph = np.zeros(N_sim)
+    F_vib = np.zeros(N_sim)
+    sigma_ph_vibr = 1e-4
+
+    A_sim = np.zeros(N_sim)
+    A0_sim = 0.15
+    A_sim[-1] = A0_sim
+    dA_sim = 1e-4
+
+    B_sim = np.zeros(N_sim)
+    B0_sim = 0.21
+    B_sim[-1] = B0_sim
+    dB_sim = 1e-4
+
+    ph_sim = np.zeros(N_sim)
+    dph_sim = Dg*2*np.pi*f*(1 - np.cos(2*np.pi*f))*keff*T*T
+
+    P_sim = np.zeros(N_sim)
+    P_sim_noise = np.zeros(N_sim)
+    sigma_A_sim = 3e-3
+
+    for i in range(N_sim):
+        g_sim[i] = g0 + Dg*np.sin(2*np.pi*f*i) + sigma_g_drift*np.random.normal()
+        F_vib[i] = np.random.uniform(-np.pi/12, np.pi/12)
+        alp[i] = alp_start[i%alp_amount] - F_vib[i]/2/np.pi/T/T
+        A_sim[i] = A_sim[i-1] + np.random.normal(0, dA_sim)
+        B_sim[i] = B_sim[i-1] + np.random.normal(0, dB_sim)
+        ph_sim[i] = keff*g_sim[i]*T*T
+        Ph[i] = 2*np.pi*alp[i]*T*T - ph_sim[i]
+        P_sim[i] = A_sim[i] - B_sim[i]*np.cos(Ph[i])
+        F_vib[i] += np.random.normal(0, sigma_ph_vibr)
+        alp[i] = alp_start[i%alp_amount] - F_vib[i]/2/np.pi/T/T
+        P_sim_noise[i] = P_sim[i] + np.random.normal(0, sigma_A_sim)
     
-# sim show
-# plt.scatter(alp, P_sim_noise)
+    dph_sim = np.std(ph_sim[1:] - np.roll(ph_sim, 1)[1:]) * 2
+
+    return alp, P_sim_noise, P_sim,  A_sim, B_sim, g_sim, dA_sim, dB_sim, dph_sim, sigma_g_drift, sigma_ph_vibr, sigma_A_sim
 
 
+# simulation params
+N_sim = 10000
+alp_amount = 201
+
+alp, P_sim_noise, P_sim, A_sim, B_sim, g_sim, dA_sim, dB_sim, dph_sim, sigma_g_drift, sigma_ph_vibr, sigma_A_sim, sim_params = simul_drift(N_sim, alp_amount)
 
 # kalman fit
-
-
-
-dA_model = np.sqrt(DA_sim**2 + dA_sim**2)
+dA_model = np.sqrt(dA_sim**2)
 dB_model = dB_sim
-dph_model = sigma_g_drift*keff*T*T #np.std(ph_sim[1:] - np.roll(ph_sim, 1)[1:]) * 2# np.sqrt(dph_sim**2 + Dph_sim**2)
+dph_model = dph_sim
 Q = np.diag([dA_model**2, dB_model**2, dph_model**2])
 
 # initial values
 poi = alp_amount
 A0, B0, ph0, P_cov0, sigma_A = init_values(alp, P_sim_noise, poi)
-sigma_ph = np.sqrt(sigma_ph_vibr**2 + dph_sim**2*0)
+sigma_ph = np.sqrt(sigma_ph_vibr**2)
 sigma_A = sigma_A_sim # only for sim
 P_m, A, B, ph, P_cov, e, en = kalmanFit_EKF(alp, P_sim_noise, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0)
 
@@ -565,15 +619,15 @@ kalmanGraphs(alp, P_sim_noise, A, B, ph, P_cov, e, en)
 # Вот нормальный блок АЧХ/ФЧХ для 3-состоянийного Kalman (A, B, φ) в точности в том же стиле, что и для четырёх — с windowFit_linear и savgol.
 # Python### ФЧХ / АЧХ (Kalman 3 states + window + savgol)
 
-sim_params = dict(
-    g0=g0, Dg=Dg, lm=lm, keff=keff, T=T,
-    alp_min=alp_min, alp_max=alp_max, alp_amount=alp_amount, alp_start=alp_start,
-    sigma_ph_vibr=sigma_ph_vibr,
-    A0_sim=A0_sim, dA_sim=dA_sim, DA_sim=DA_sim,
-    B0_sim=B0_sim, dB_sim=dB_sim,
-    dph_sim=dph_sim,
-    sigma_A_sim=sigma_A_sim,
-)
+# sim_params = dict(
+#     g0=g0, Dg=Dg, lm=lm, keff=keff, T=T,
+#     alp_min=alp_min, alp_max=alp_max, alp_amount=alp_amount, alp_start=alp_start,
+#     sigma_ph_vibr=sigma_ph_vibr,
+#     A0_sim=A0_sim, dA_sim=dA_sim, DA_sim=DA_sim,
+#     B0_sim=B0_sim, dB_sim=dB_sim,
+#     dph_sim=dph_sim,
+#     sigma_A_sim=sigma_A_sim,
+# )
 
 
 def savgolFilter(g_in, window_length, polyorder):
