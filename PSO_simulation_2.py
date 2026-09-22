@@ -303,7 +303,6 @@ poi = alp_amount
 A0, B0, ph0, P_cov0, sigma_A = init_values(alp, P_sim_noise, poi)
 sigma_ph = np.sqrt(sigma_ph_vibr**2 + dph_sim**2*0)
 sigma_A = sigma_A_sim # only for sim
-#P_m, A, B, ph, P_cov, e, en = kalmanFit_EKF(alp, P_sim_noise, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0)
  
 #PSO params
 tau_range = [0, 1000]
@@ -394,10 +393,12 @@ def PSO(fitness_func, N_particles, M_iter, tau_range, K_range, alp, P_exp, a_m):
     gbest_fit = np.inf
  
     history = []
+    n_calls = 0
  
     for it in range(M_iter):
         for i in range(N_particles):
             fit = fitness_func(pos[i, 0], pos[i, 1], alp, P_exp, a_m)
+            n_calls += 1
  
             if fit < pbest_fit[i]:
                 pbest_fit[i] = fit
@@ -424,7 +425,7 @@ def PSO(fitness_func, N_particles, M_iter, tau_range, K_range, alp, P_exp, a_m):
     best_tau = int(np.round(gbest[0]))
     best_K = gbest[1]
  
-    return best_tau, best_K, gbest_fit, history
+    return best_tau, best_K, gbest_fit, history, n_calls
  
  
 def sequential_grid_search(fitness_func, tau_range, K_range, alp, P_exp, a_m,
@@ -462,14 +463,131 @@ def sequential_grid_search(fitness_func, tau_range, K_range, alp, P_exp, a_m,
     ])
     K_opt = float(K_vals[np.argmin(fitness_K)])
  
-    best_fit = fitness_func(tau_opt, K_opt, alp, P_exp, a_m)
+    best_fit = float(np.min(fitness_K))
+    n_calls = len(tau_vals) + len(K_vals)
  
     history = {
         "tau_vals": tau_vals, "fitness_tau": fitness_tau,
         "K_vals": K_vals, "fitness_K": fitness_K,
     }
  
-    return tau_opt, K_opt, best_fit, history
+    return tau_opt, K_opt, best_fit, n_calls, history
+ 
+ 
+# ============================================================
+# ПОЛНАЯ 2D-СЕТКА, закрытая форма cos-подгонки (БЕЗ numba/prange --
+# обычная векторизация numpy: внешний цикл по tau -- plain Python,
+# все K для данного tau считаются одним численным выражением)
+# ============================================================
+ 
+def full_grid_search_curvefit(alp, P_exp, a_m, tau_range, K_range, n_K=401, tau_step=1):
+    """
+    Полная 2D-сетка (tau, K). Fitness для каждой ячейки -- замкнутая
+    форма линейной cos-подгонки (тот же приём, что в init_values_linear/
+    windowFit_linear): вместо нелинейного curve_fit(A,B,ph) решаем
+    линейную МНК по регрессорам c=cos(Phi0-K*Fr), s=sin(Phi0-K*Fr),
+    что математически эквивалентно curvefit_fitness, но без итеративной
+    нелинейной оптимизации на каждую ячейку сетки.
+ 
+    БЕЗ numba/prange/joblib: внешний цикл по tau -- обычный Python for,
+    один поток; для фиксированного tau все n_K значений K считаются
+    одним numpy-выражением (векторизация numpy, а не JIT/параллелизм).
+    """
+    tau_vals = np.arange(tau_range[0], tau_range[1] + 1, tau_step)
+    K_vals = np.linspace(K_range[0], K_range[1], n_K)
+ 
+    Phi0 = 2*np.pi*alp*T**2
+    cosPhi0 = np.cos(Phi0)
+    sinPhi0 = np.sin(Phi0)
+    N = len(alp)
+    syy = float(np.sum(P_exp**2))
+    sy = float(np.sum(P_exp))
+ 
+    fitness = np.full((len(tau_vals), len(K_vals)), 1e6)
+    n_calls = 0
+ 
+    for it, tau in enumerate(tau_vals):
+ 
+        if tau + end > a_m.shape[1]:
+            continue  # окно акселерометра выходит за пределы записи
+ 
+        Fr = keff * (a_m[:, tau:tau + end] @ weight_vec)   # (N,) -- для этой tau, все K используют его
+ 
+        # ang, c, s: (n_K, N) -- по всем K сразу, обычная numpy-векторизация
+        ang = K_vals[:, None] * Fr[None, :]
+        ca = np.cos(ang)
+        sa = np.sin(ang)
+        c = cosPhi0[None, :]*ca + sinPhi0[None, :]*sa      # cos(Phi0 - K*Fr)
+        s = sinPhi0[None, :]*ca - cosPhi0[None, :]*sa      # sin(Phi0 - K*Fr)
+ 
+        s1 = N
+        sc = c.sum(axis=1); ss = s.sum(axis=1)
+        scc = (c*c).sum(axis=1); sss = (s*s).sum(axis=1); scs = (c*s).sum(axis=1)
+        scy = c @ P_exp; ssy = s @ P_exp
+ 
+        n_calls += len(K_vals)
+ 
+        det = (s1*(scc*sss - scs*scs)
+               - sc*(sc*sss - scs*ss)
+               + ss*(sc*scs - scc*ss))
+ 
+        with np.errstate(invalid="ignore", divide="ignore"):
+            detA = (sy*(scc*sss - scs*scs)
+                    - sc*(scy*sss - scs*ssy)
+                    + ss*(scy*scs - scc*ssy))
+            detBc = (s1*(scy*sss - scs*ssy)
+                     - sy*(sc*sss - scs*ss)
+                     + ss*(sc*ssy - scy*ss))
+            detBs = (s1*(scc*ssy - scy*scs)
+                     - sc*(sc*ssy - scy*ss)
+                     + sy*(sc*scs - scc*ss))
+ 
+            A = detA/det
+            Bc = detBc/det
+            Bs = detBs/det
+ 
+            RSS = syy - (A*sy + Bc*scy + Bs*ssy)
+ 
+        bad = (np.abs(det) < 1e-12) | ~np.isfinite(RSS) | (RSS < 0)
+        row_fitness = np.where(bad, 1e6, np.sqrt(np.maximum(RSS, 0.0)/N))
+ 
+        fitness[it] = row_fitness
+ 
+    idx = np.unravel_index(np.argmin(fitness), fitness.shape)
+    tau_opt = int(tau_vals[idx[0]])
+    K_opt = float(K_vals[idx[1]])
+    return tau_opt, K_opt, float(fitness[idx]), n_calls, {
+        "tau_vals": tau_vals, "K_vals": K_vals, "fitness": fitness}
+ 
+ 
+# ============================================================
+# ПОЛНАЯ 2D-СЕТКА, fitness = EKF innovations (БЕЗ joblib --
+# обычный последовательный двойной цикл, один поток)
+# ============================================================
+ 
+def full_grid_search_kalman(tau_range, K_range, alp, P_exp, a_m, n_tau=41, n_K=21):
+    """Полная 2D-сетка (tau, K) с fitness = std innovations EKF.
+    Обычный последовательный двойной цикл -- каждая ячейка считается
+    по очереди, без joblib/многопроцессности. Медленнее ускоренной
+    версии (нет распараллеливания по ядрам), но проще и предсказуемее."""
+ 
+    tau_vals = np.unique(np.round(np.linspace(tau_range[0], tau_range[1], n_tau)).astype(int))
+    K_vals = np.linspace(K_range[0], K_range[1], n_K)
+ 
+    fitness = np.full((len(tau_vals), len(K_vals)), np.nan)
+    n_calls = 0
+ 
+    for it, tau in enumerate(tau_vals):
+        for ik, Kv in enumerate(K_vals):
+            fitness[it, ik] = kalman_fitness(int(tau), Kv, alp, P_exp, a_m)
+            n_calls += 1
+        print(f"  full_grid_search_kalman: строка {it+1}/{len(tau_vals)} (tau={tau}) готова")
+ 
+    idx = np.unravel_index(np.nanargmin(fitness), fitness.shape)
+    tau_opt = int(tau_vals[idx[0]])
+    K_opt = float(K_vals[idx[1]])
+    return tau_opt, K_opt, float(fitness[idx]), n_calls, {
+        "tau_vals": tau_vals, "K_vals": K_vals, "fitness": fitness}
  
  
 def evaluate_with_kalman(tau, K, alp, P_exp, a_noise_all):
@@ -486,63 +604,82 @@ def evaluate_with_kalman(tau, K, alp, P_exp, a_noise_all):
     )
     return alp_comp, ph, e, en
  
-def g_error_stats(ph, g_sim, warmup=50):
+def g_error_stats(ph, g_sim, warmup=50, bias_warn_threshold=1e-3):
     """RMS ошибки определения g относительно истины. Вычитаем медианный
-    сдвиг перед RMS -- если curve_fit при инициализации попал не в ту
-    ветвь фринджа (сдвиг на 2π·n), это даст константный оффсет, который
-    иначе замаскирует реальную точность СЛЕЖЕНИЯ под случайную ошибку
-    инициализации."""
+    сдвиг перед RMS_debiased -- но также возвращаем RMS_total (без
+    вычитания ничего) и явно предупреждаем, если bias подозрительно
+    велик (похоже на ошибку разрешения порядка фринджа, а не на
+    обычную ошибку инициализации)."""
     g_est = ph / keff / T**2
     diff = g_est[warmup:] - g_sim[warmup:]
-    bias = np.median(diff)
-    rms = np.sqrt(np.mean((diff - bias)**2))
-    return rms, bias, g_est
  
-def report_case(label, tau, K, ph_est, e_arr, g_sim, elapsed_s, warmup=50):
+    bias = np.median(diff)
+    if abs(bias) > bias_warn_threshold:
+        print(f"⚠ ВНИМАНИЕ: bias(g) = {bias*1e8:.3f} µGal подозрительно велик — "
+              f"похоже на ошибку разрешения порядка фринджа")
+ 
+    rms_debiased = np.sqrt(np.mean((diff - bias)**2))
+    rms_total = np.sqrt(np.mean(diff**2))
+ 
+    return rms_total, rms_debiased, bias, g_est
+ 
+def report_case(label, tau, K, ph_est, e_arr, g_sim, elapsed_s, n_calls, warmup=50):
     std_e = np.std(e_arr[warmup:])
-    rms_g, bias_g, _ = g_error_stats(ph_est, g_sim, warmup=warmup)
-    print(f"{label:22s}{tau:8d}{K:10.4f}{std_e:16.4e}{rms_g*1e8:16.3f}{bias_g*1e8:14.3f}{elapsed_s:12.2f}")
-    return std_e, rms_g, bias_g
+    rms_total, rms_debiased, bias_g, _ = g_error_stats(ph_est, g_sim, warmup=warmup)
+    print(f"{label:26s}{tau:8d}{K:10.4f}{std_e:16.4e}{rms_total*1e8:16.3f}"
+          f"{bias_g*1e8:14.3f}{rms_debiased*1e8:16.3f}{elapsed_s:12.2f}{n_calls:12d}")
+    return std_e, rms_total, bias_g, rms_debiased
  
  
 if __name__ == "__main__":
  
     warmup = 50
+    results = {}  # label -> (tau, K, elapsed_s, n_calls)
  
     print("=== PSO with Kalman-filter fitness ===")
     t0 = time.perf_counter()
-    tau_kf, K_kf, fit_kf, history_kf = PSO(
+    tau_kf, K_kf, fit_kf, history_kf, calls_kf = PSO(
         kalman_fitness, N_particles, M_iter, tau_range, K_range, alp, P_sim_noise, a_m
     )
-    time_kf = time.perf_counter() - t0
+    results["PSO (Kalman)"] = (tau_kf, K_kf, time.perf_counter() - t0, calls_kf)
  
     print("\n=== PSO with global curve_fit fitness ===")
     t0 = time.perf_counter()
-    tau_cf, K_cf, fit_cf, history_cf = PSO(
+    tau_cf, K_cf, fit_cf, history_cf, calls_cf = PSO(
         curvefit_fitness, N_particles, M_iter, tau_range, K_range, alp, P_sim_noise, a_m
     )
-    time_cf = time.perf_counter() - t0
+    results["PSO (curve_fit)"] = (tau_cf, K_cf, time.perf_counter() - t0, calls_cf)
  
     print("\n=== Sequential grid search (coefficient searching, cos-fit RMSE) ===")
     t0 = time.perf_counter()
-    tau_gs, K_gs, fit_gs, history_gs = sequential_grid_search(
+    tau_gs, K_gs, fit_gs, calls_gs, history_gs = sequential_grid_search(
         curvefit_fitness, tau_range, K_range, alp, P_sim_noise, a_m
     )
-    time_gs = time.perf_counter() - t0
-    print(f"tau_opt = {tau_gs}, K_opt = {K_gs:.4f}, fitness = {fit_gs:.4e}, time = {time_gs:.2f} s")
+    results["Sequential (curve_fit)"] = (tau_gs, K_gs, time.perf_counter() - t0, calls_gs)
  
-    # общая мерка (EKF innovations + RMS по g) для всех трёх найденных компенсаций
-    alp_kf, ph_kf, e_kf, en_kf = evaluate_with_kalman(tau_kf, K_kf, alp, P_sim_noise, a_m)
-    alp_cf, ph_cf, e_cf, en_cf = evaluate_with_kalman(tau_cf, K_cf, alp, P_sim_noise, a_m)
-    alp_gs, ph_gs, e_gs, en_gs = evaluate_with_kalman(tau_gs, K_gs, alp, P_sim_noise, a_m)
+    print("\n=== FULL 2D grid, closed-form cos-fit (plain numpy, no numba) ===")
+    t0 = time.perf_counter()
+    tau_g1, K_g1, fit_g1, calls_g1, history_g1 = full_grid_search_curvefit(
+        alp, P_sim_noise, a_m, tau_range, K_range, n_K=401, tau_step=1
+    )
+    results["Full grid (cos-fit)"] = (tau_g1, K_g1, time.perf_counter() - t0, calls_g1)
  
-    print("\n===================== Сравнение =====================")
-    print(f"{'':22s}{'tau':>8s}{'K':>10s}{'std(e), EKF':>16s}{'RMS(g), uGal':>16s}{'bias(g), uGal':>14s}{'time, s':>12s}")
-    print(f"{'true':22s}{delay:8d}{K:10.4f}")
+    print("\n=== FULL 2D grid, Kalman fitness (plain sequential loop, no joblib) ===")
+    t0 = time.perf_counter()
+    tau_g2, K_g2, fit_g2, calls_g2, history_g2 = full_grid_search_kalman(
+        tau_range, K_range, alp, P_sim_noise, a_m, n_tau=41, n_K=21
+    )
+    results["Full grid (Kalman)"] = (tau_g2, K_g2, time.perf_counter() - t0, calls_g2)
  
-    report_case("Kalman-fitness PSO", tau_kf, K_kf, ph_kf, e_kf, g_sim, time_kf, warmup)
-    report_case("curve_fit-fitness PSO", tau_cf, K_cf, ph_cf, e_cf, g_sim, time_cf, warmup)
-    report_case("Sequential grid search", tau_gs, K_gs, ph_gs, e_gs, g_sim, time_gs, warmup)
+    # --- единая метрика (EKF innovations + точность g) для всех методов ---
+    print("\n============================== Сравнение ==============================")
+    print(f"{'':26s}{'tau':>8s}{'K':>10s}{'std(e), EKF':>16s}{'RMS_tot(g), uGal':>16s}"
+          f"{'bias(g), uGal':>14s}{'RMS_deb(g), uGal':>16s}{'time, s':>12s}{'fitness calls':>12s}")
+    print(f"{'true':26s}{delay:8d}{K:10.4f}")
+ 
+    for label, (tau_v, K_v, t_v, n_calls_v) in results.items():
+        alp_v, ph_v, e_v, en_v = evaluate_with_kalman(tau_v, K_v, alp, P_sim_noise, a_m)
+        report_case(label, tau_v, K_v, ph_v, e_v, g_sim, t_v, n_calls_v, warmup)
  
     # --- convergence curves (PSO) ---
     plt.figure()
@@ -553,7 +690,7 @@ if __name__ == "__main__":
     plt.title("PSO convergence: Kalman vs curve_fit")
     plt.legend()
  
-    # --- ход перебора tau и K для grid search ---
+    # --- ход перебора tau и K для sequential grid search ---
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
     axes[0].plot(history_gs["tau_vals"], history_gs["fitness_tau"])
     axes[0].axvline(tau_gs, color="k", ls="--", label=f"tau_opt={tau_gs}")
@@ -570,11 +707,22 @@ if __name__ == "__main__":
     axes[1].legend()
     fig.tight_layout()
  
+    # --- heatmap полной сетки (closed-form cos-fit) ---
+    fig, ax = plt.subplots(figsize=(7, 5))
+    im = ax.pcolormesh(history_g1["K_vals"], history_g1["tau_vals"], history_g1["fitness"],
+                        shading="auto")
+    ax.plot(K_g1, tau_g1, 'r*', markersize=12, label=f"optimum (tau={tau_g1}, K={K_g1:.3f})")
+    ax.set_xlabel("K")
+    ax.set_ylabel("tau")
+    ax.set_title("Полная сетка (closed-form cos-fit): fitness(tau, K)")
+    fig.colorbar(im, ax=ax, label="fitness (std cos-fit residual)")
+    ax.legend()
+ 
     # --- итоговые innovations ---
     plt.figure()
-    plt.plot(e_kf, label=f"Kalman-fitness PSO (tau={tau_kf}, K={K_kf:.3f})", alpha=0.8)
-    plt.plot(e_cf, label=f"curve_fit-fitness PSO (tau={tau_cf}, K={K_cf:.3f})", alpha=0.8)
-    plt.plot(e_gs, label=f"Grid search (tau={tau_gs}, K={K_gs:.3f})", alpha=0.8)
+    for label, (tau_v, K_v, t_v, n_calls_v) in results.items():
+        _, ph_v, e_v, _ = evaluate_with_kalman(tau_v, K_v, alp, P_sim_noise, a_m)
+        plt.plot(e_v, label=f"{label} (tau={tau_v}, K={K_v:.3f})", alpha=0.8)
     plt.xlabel("shot #")
     plt.ylabel("EKF innovation e")
     plt.title("Итоговые невязки EKF при разных способах компенсации")
@@ -582,9 +730,9 @@ if __name__ == "__main__":
  
     # --- ошибка определения g в физических единицах ---
     plt.figure()
-    plt.plot((ph_kf/keff/T**2 - g_sim)*1e8, label="Kalman-fitness PSO", alpha=0.8)
-    plt.plot((ph_cf/keff/T**2 - g_sim)*1e8, label="curve_fit-fitness PSO", alpha=0.8)
-    plt.plot((ph_gs/keff/T**2 - g_sim)*1e8, label="Grid search", alpha=0.8)
+    for label, (tau_v, K_v, t_v, n_calls_v) in results.items():
+        _, ph_v, _, _ = evaluate_with_kalman(tau_v, K_v, alp, P_sim_noise, a_m)
+        plt.plot((ph_v/keff/T**2 - g_sim)*1e8, label=label, alpha=0.8)
     plt.xlabel("shot #")
     plt.ylabel(r"$g_{est} - g_{sim}$, µGal")
     plt.title("Ошибка определения g при разных способах компенсации вибрации")
