@@ -1030,9 +1030,31 @@ def evaluate_with_kalman(tau, Kz, Kx, Ky, alp, P_exp, az_m, ax_m, ay_m):
         alp_comp, P_exp, T, Q, P_cov0e, sigma_A_sim, sigma_ph, A0e, B0e, ph0e)
     return alp_comp, ph, e, en
 
+def resolve_g_fringe_order(g_raw, g0_prior=G0_PRIOR):
+    """
+    Постобработка: убирает 2π-неоднозначность в готовой последовательности
+    g_est, никак не трогая внутренности EKF. Анкер для первой точки --
+    g0_prior, для всех последующих -- предыдущая УЖЕ скорректированная
+    точка (предполагается, что истинный g меняется от сброса к сбросу
+    много медленнее, чем dg_quantum).
+    """
+    dg_quantum = 2*np.pi / (keff * T**2)
+    g_corr = np.empty_like(g_raw)
+
+    k0 = np.round((g0_prior - g_raw[0]) / dg_quantum)
+    g_corr[0] = g_raw[0] + k0*dg_quantum
+
+    for i in range(1, len(g_raw)):
+        k = np.round((g_corr[i-1] - g_raw[i]) / dg_quantum)
+        g_corr[i] = g_raw[i] + k*dg_quantum
+
+    return g_corr
+
 
 def g_error_stats(ph, g_sim, warmup=50, bias_warn_threshold=1e-3):
-    g_est = ph / keff / T**2
+    g_raw = ph / keff / T**2
+    #g_est = ph / keff / T**2
+    g_est = resolve_g_fringe_order(g_raw)
     diff = g_est[warmup:] - g_sim[warmup:]
 
     bias = np.median(diff)
