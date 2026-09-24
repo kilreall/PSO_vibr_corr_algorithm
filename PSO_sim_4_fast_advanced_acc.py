@@ -453,7 +453,7 @@ def simul_acc(N_sim, alp_amount, delay, Kz, Kx, Ky,
     g0 = 9.8101507
     g_sim = np.zeros(N_sim); g_sim[-1] = g0
     drift_corr = 3000
-    Dg_drift = 30e-8
+    Dg_drift = 100e-8
     theta_drift = 1 - np.exp(-1.0/drift_corr)
     sigma_g_drift = Dg_drift * np.sqrt(theta_drift*(2 - theta_drift))
     print(f"sigma_g_drift = {sigma_g_drift}")
@@ -482,12 +482,12 @@ def simul_acc(N_sim, alp_amount, delay, Kz, Kx, Ky,
                       * np.sqrt(Kz**2 + Kx**2 + Ky**2))
     print(f"sigma_ph_vibr = {sigma_ph_vibr/keff/T/T*1e8} uGal")
 
-    A_sim = np.zeros(N_sim); A_sim[-1] = 0.15; dA_sim = 1e-4
-    B_sim = np.zeros(N_sim); B_sim[-1] = 0.21; dB_sim = 1e-4
+    A_sim = np.zeros(N_sim); A_sim[-1] = 0.15; dA_sim = 5e-3
+    B_sim = np.zeros(N_sim); B_sim[-1] = 0.21; dB_sim = 5e-3
     ph_sim = np.zeros(N_sim)
     P_sim = np.zeros(N_sim)
     P_sim_noise = np.zeros(N_sim)
-    sigma_A_sim = 3e-3
+    sigma_A_sim = 7e-3
 
     rng_vib = np.random.default_rng(seed_vib)
 
@@ -551,7 +551,7 @@ SEQ_N_TAU = None
 SEQ_N_KZ = 401
 SEQ_N_KX = 201
 SEQ_N_KY = 201
-SEQ_N_PASSES = 2
+SEQ_N_PASSES = 1
 SEQ_TAU_INIT = 500
 SEQ_KZ_INIT = Kz_nominal
 SEQ_KX_INIT = Kx_nominal
@@ -562,10 +562,10 @@ GRID_CF_N_KZ = 11
 GRID_CF_N_KX = 5
 GRID_CF_N_KY = 5
 
-GRID_KF_N_TAU = 17
+GRID_KF_N_TAU = 21
 GRID_KF_N_KZ = 11
-GRID_KF_N_KX = 4
-GRID_KF_N_KY = 4
+GRID_KF_N_KX = 5
+GRID_KF_N_KY = 5
 
 N_JOBS = None
 
@@ -1072,6 +1072,23 @@ def report_case(label, tau, Kz, Kx, Ky, ph_est, e_arr, g_sim, elapsed_s, n_calls
           f"{elapsed_s:10.2f}{n_calls:12d}")
     return std_e, rms_total, bias_g, rms_debiased
 
+def nocomp_cosfit_g(alp, P_exp, g_sim):
+    """
+    Оценка g БЕЗ компенсации вибрации: один cos-fit (curve_fit) по всей
+    серии, без Калмана. Начальное приближение и порядок фринджа берутся
+    из init_values (анкер G0_PRIOR); фаза ищется в окне ±π вокруг ph0,
+    чтобы fit не ушёл на соседнюю ветвь 2π.
+    Возвращает (g_cf, g_cf - g_sim[-1], popt).
+    """
+    A0, B0, ph0, _, _ = init_values(alp, P_exp, poi)
+    lb_p = [-1.1, 0.0, ph0 - np.pi]
+    ub_p = [1.1, 1.1, ph0 + np.pi]
+    popt, _ = curve_fit(model, alp, P_exp, p0=[A0, B0, ph0],
+                        bounds=(lb_p, ub_p), maxfev=5000)
+    g_raw = popt[2] / keff / T**2
+    g_cf = resolve_g_fringe_order(np.array([g_raw]))[0]
+    return g_cf, g_cf - g_sim[-1], popt
+
 
 if __name__ == "__main__":
  
@@ -1172,16 +1189,9 @@ if __name__ == "__main__":
         n_jobs=N_JOBS, warmup=warmup)
     results["Full grid (Kalman)"] = (tau_g2, Kz_g2, Kx_g2, Ky_g2, time.perf_counter() - t0, calls_g2)
  
-    # --- baseline: БЕЗ КОМПЕНСАЦИИ вибрации (Kz=Kx=Ky=0) ---
-    # tau здесь не имеет значения (при K=0 F_vib_total=0 при любом tau),
-    # ставим 0 просто для единообразия отчёта; time/calls = 0, т.к.
-    # никакого поиска не производится -- alp не меняется вовсе.
-    # Вставляем первой записью в results, чтобы она шла первой строкой
-    # в таблице сравнения и на всех графиках ниже (EKF innovations,
-    # ошибка g) как референс "было бы, если вообще не компенсировать".
-    results_with_baseline = {"No compensation (Kz=Kx=Ky=0)": (0, 0.0, 0.0, 0.0, 0.0, 0)}
-    results_with_baseline.update(results)
-    results = results_with_baseline
+    # --- baseline: БЕЗ компенсации, через cos-fit (не через EKF: для
+    #     Калмана вибрация без коррекции -- неучтённый шум) ---
+    g_cf_nc, dg_cf_nc, _ = nocomp_cosfit_g(alp, P_sim_noise, g_sim)
  
     print("\n===================================== Сравнение =====================================")
     print(f"{'':24s}{'tau':>7s}{'Kz':>9s}{'Kx':>10s}{'Ky':>10s}{'std(e)':>14s}"
@@ -1192,7 +1202,11 @@ if __name__ == "__main__":
         alp_v, ph_v, e_v, en_v = evaluate_with_kalman(
             tau_v, Kz_v, Kx_v, Ky_v, alp, P_sim_noise, az_m, ax_m, ay_m)
         report_case(label, tau_v, Kz_v, Kx_v, Ky_v, ph_v, e_v, g_sim, t_v, n_calls_v, warmup)
- 
+    print("-"*140)
+    print(f"No compensation (cos-fit по всей серии, без Калмана):")
+    print(f"    g_cf          = {g_cf_nc:.9f} м/с^2")
+    print(f"    g_sim[-1]     = {g_sim[-1]:.9f} м/с^2")
+    print(f"    g_cf - g_sim[-1] = {dg_cf_nc*1e8:.3f} µGal")
     plt.figure()
     plt.plot(hist_kf, label="Kalman fitness")
     plt.plot(hist_cf, label="curve_fit fitness")
@@ -1231,6 +1245,8 @@ if __name__ == "__main__":
     for label, (tau_v, Kz_v, Kx_v, Ky_v, t_v, n_calls_v) in results.items():
         _, ph_v, _, _ = evaluate_with_kalman(tau_v, Kz_v, Kx_v, Ky_v, alp, P_sim_noise, az_m, ax_m, ay_m)
         plt.plot((ph_v/keff/T**2 - g_sim)*1e8, label=label, alpha=0.8)
+    plt.axhline(dg_cf_nc*1e8, color='k', ls='--',
+                label=f"No compensation, cos-fit: {dg_cf_nc*1e8:.1f} µGal")
     plt.xlabel("shot #")
     plt.ylabel(r"$g_{est} - g_{sim}$, µGal")
     plt.title(f"Ошибка определения g при разных способах компенсации, vib_state={VIB_STATE}")
