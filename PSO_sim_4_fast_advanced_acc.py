@@ -12,12 +12,12 @@ from scipy.signal import butter, filtfilt
 
 def fa(t):
     if 0 < t <= T+2*ty:
-        return t/(T+2*ty)**2
+        return t
     elif T+2*ty < t <= 2*T+4*ty:
-        return (2*(T+2*ty)-t)/(T+2*ty)**2
+        return 2*(T+2*ty)-t
     else:
         return 0
-fat_v = np.vectorize(fa)
+fat_v = np.vectorize(fa, otypes=[float])   # <-- КРИТИЧНО: явно задать float
 
 def model(alp, A, B, ph):
     return A - B*np.cos(2*np.pi*alp*T**2 - ph)
@@ -476,7 +476,7 @@ def simul_acc(N_sim, alp_amount, delay, Kz, Kx, Ky,
     az_m = np.zeros((N_sim, N_RP))
     ax_m = np.zeros((N_sim, N_RP))
     ay_m = np.zeros((N_sim, N_RP))
-    sigma_a = 0.8e-8
+    sigma_a = 3e-5
 
     # суммарный фазовый шум от вибрации -- независимые вклады трёх осей
     # складываются в квадратуре (та же формула распространения ошибки,
@@ -543,8 +543,8 @@ Kz_range = [0.7, 1.1]
 Kx_range = [0.0, 0.025]
 Ky_range = [0.0, 0.025]
 
-N_particles = 40
-M_iter = 60
+N_particles = 30
+M_iter = 30
 
 Kz_nominal = 1.0
 Kx_nominal = 0.0

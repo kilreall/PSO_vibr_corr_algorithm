@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # --- Настройки ---
-file_path = "data_file_192.168.55.72_2026-09-16_19-54-21.bin"
+file_path = r"acc_real_data\data_file_192.168.55.72_2026-09-16_19-21-43.bin"
 dtype = np.int16
 raw_data = np.fromfile(file_path, dtype=dtype)
 ch1 = raw_data
@@ -20,6 +20,8 @@ time = np.arange(len(data)) / sample_rate
 
 # 2. Расчет FFT
 n = len(data)
+print(f"data amount = {len(data)}")
+print(f"data amount in counts = {len(data)/16834}")
 fft_result = np.fft.fft(data)             # Вычисление FFT
 frequencies = np.fft.fftfreq(n, 1 / sample_rate) # Оси частот
 

@@ -12,12 +12,12 @@ from scipy.signal import butter, filtfilt
  
 def fa(t):
     if 0 < t <= T+2*ty:
-        return t/(T+2*ty)**2
+        return t
     elif T+2*ty < t <= 2*T+4*ty:
-        return (2*(T+2*ty)-t)/(T+2*ty)**2
+        return 2*(T+2*ty)-t
     else:
         return 0
-fat_v = np.vectorize(fa)
+fat_v = np.vectorize(fa, otypes=[float])   # <-- КРИТИЧНО: явно задать float
  
 def model(alp, A, B, ph):
     return A - B*np.cos(2*np.pi*alp*T**2 - ph)
