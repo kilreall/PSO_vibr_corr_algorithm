@@ -1087,7 +1087,7 @@ def report_case(label, tau, Kz, Kx, Ky, ph_est, e_arr, g_sim, elapsed_s, n_calls
     std_e = np.std(e_arr[warmup:])
     rms_total, rms_debiased, bias_g, _ = g_error_stats(ph_est, g_sim, warmup=warmup)
     print(f"{label:24s}{tau:7d}{Kz:9.4f}{Kx:10.5f}{Ky:10.5f}{std_e:14.3e}"
-          f"{rms_total*1e8:14.3f}{bias_g*1e8:13.3f}{rms_debiased*1e8:14.3f}"
+          f"{rms_total*1e8:14.0f}{bias_g*1e8:13.0f}{rms_debiased*1e8:14.0f}"
           f"{elapsed_s:10.2f}{n_calls:12d}")
     return std_e, rms_total, bias_g, rms_debiased
 
@@ -1145,7 +1145,7 @@ if __name__ == "__main__":
     # kalman fit
     Q = np.diag([dA_sim**2, dB_sim**2, dph_sim**2])
     poi = alp_amount
-    poi = 100
+    poi = 201
     A0, B0, ph0, P_cov0, sigma_A = init_values(alp, P_sim_noise, poi)
     sigma_ph = np.sqrt(sigma_ph_vibr**2 + dph_sim**2*0)
     sigma_A = sigma_A_sim
@@ -1254,16 +1254,39 @@ if __name__ == "__main__":
     print(f"    g_cf - g_sim[-1] = {dg_cf_nc*1e8:.3f} µGal")
 
     # --- честное сравнение: и baseline, и все методы -- одним оконным cos-fit ---
-    print("\n---- Оконный cos-fit: g_win - <g_sim>_окна (µGal) ----")
-    print(f"{'':28s}{'RMS':>10s}{'mean':>10s}   по окнам")
+    def _fmt_g(val_uGal):
+        """Компактный формат: переключается на mGal, если величина большая."""
+        if abs(val_uGal) > 1e5:
+            return f"{val_uGal/1e3:.1f} mGal"
+        return f"{val_uGal:.0f} µGal"
+
+    def _print_win_row(label, dg):
+        rms = np.sqrt(np.mean(dg**2)) * 1e8
+        mean = np.mean(dg) * 1e8
+        median = np.median(dg) * 1e8
+        amax = np.max(np.abs(dg)) * 1e8
+        print(f"{label:28s}{_fmt_g(rms):>12s}{_fmt_g(mean):>12s}"
+              f"{_fmt_g(median):>12s}{_fmt_g(amax):>12s}")
+
+    def print_windows_detail(label, dg, per_line=10):
+        """Опционально: подробный список по окнам (µGal, целые), в несколько строк."""
+        vals = [f"{v*1e8:>7.0f}" for v in dg]
+        print(f"  {label}:")
+        for i in range(0, len(vals), per_line):
+            print("    " + " ".join(vals[i:i + per_line]))
+
+    print("\n---- Оконный cos-fit: g_win - <g_sim>_окна ----")
+    print(f"{'':28s}{'RMS':>12s}{'mean':>12s}{'median':>12s}{'|max|':>12s}")
+
     _, dg0, rms0, m0 = windowed_g_error(alp, P_sim_noise, g_sim, WIN_EDGES)
-    print(f"{'No compensation':28s}{rms0*1e8:10.2f}{m0*1e8:10.2f}   "
-          + ", ".join(f"{d*1e8:.1f}" for d in dg0))
+    _print_win_row("No compensation", dg0)
+
+    windowed_errors = {"No compensation": dg0}
     for label, (tau_v, Kz_v, Kx_v, Ky_v, t_v, n_calls_v) in results.items():
         alp_c = compensate_alp(tau_v, Kz_v, Kx_v, Ky_v, alp, az_m, ax_m, ay_m)
         _, dgc, rmsc, mc = windowed_g_error(alp_c, P_sim_noise, g_sim, WIN_EDGES)
-        print(f"{label:28s}{rmsc*1e8:10.2f}{mc*1e8:10.2f}   "
-              + ", ".join(f"{d*1e8:.1f}" for d in dgc))
+        _print_win_row(label, dgc)
+        windowed_errors[label] = dgc
 
     plt.figure()
     plt.plot(hist_kf, label="Kalman fitness")
