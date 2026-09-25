@@ -332,6 +332,8 @@ F_LOW_PHYS = 1.0 / (2*T)
 # Симуляция с вибрацией по трём осям
 # ============================================================
 
+SIGMA_A_ACC = 3e-5   # шум акселерометра -- должно совпадать с sigma_a в simul_acc
+
 def simul_acc(N_sim, alp_amount, delay, Kz, Kx, Ky,
               vib_state='mooring', hp_cutoff=0.01, platform_atten_db=-80.0,
               seed_vib=None):
@@ -384,7 +386,7 @@ def simul_acc(N_sim, alp_amount, delay, Kz, Kx, Ky,
     az_m = np.zeros((N_sim, N_RP))
     ax_m = np.zeros((N_sim, N_RP))
     ay_m = np.zeros((N_sim, N_RP))
-    sigma_a = 3e-5
+    sigma_a = SIGMA_A_ACC
 
     # суммарный фазовый шум от вибрации -- независимые вклады трёх осей
     # складываются в квадратуре, каждый со своим K
@@ -496,6 +498,8 @@ def compensate_alp(tau, Kz, Kx, Ky, alp, az_m, ax_m, ay_m):
     F_vib_total = Kz*Fz + Kx*Fx + Ky*Fy
     return alp - F_vib_total / (2 * np.pi * T**2)
 
+def sigma_ph_from_K(Kz, Kx, Ky, sigma_a=SIGMA_A_ACC):
+    return keff * t_step * sigma_a * np.sqrt(np.sum(fa_t**2)) * np.sqrt(Kz**2 + Kx**2 + Ky**2)
 
 def kalman_fitness(tau, Kz, Kx, Ky, alp, P_exp, az_m, ax_m, ay_m, warmup=50):
     tau = int(np.clip(round(tau), tau_range[0], tau_range[1]))
@@ -507,6 +511,7 @@ def kalman_fitness(tau, Kz, Kx, Ky, alp, P_exp, az_m, ax_m, ay_m, warmup=50):
         return 1e6
 
     alp_comp = compensate_alp(tau, Kz, Kx, Ky, alp, az_m, ax_m, ay_m)
+    sigma_ph_cand = sigma_ph_from_K(Kz, Kx, Ky)
 
     try:
         A0p, B0p, ph0p, P_cov0p, _ = init_values(alp_comp, P_exp, poi)
@@ -514,7 +519,7 @@ def kalman_fitness(tau, Kz, Kx, Ky, alp, P_exp, az_m, ax_m, ay_m, warmup=50):
         return 1e6
     try:
         _, _, _, _, _, e, _ = kalmanFit_EKF(
-            alp_comp, P_exp, T, Q, P_cov0p, sigma_A_sim, sigma_ph, A0p, B0p, ph0p)
+            alp_comp, P_exp, T, Q, P_cov0p, sigma_A_sim, sigma_ph_cand, A0p, B0p, ph0p)
     except Exception:
         return 1e6
 
@@ -714,13 +719,14 @@ def _pso_particle_worker(x):
     alp_comp = _g_alp - (Kz*Fz + Kx*Fx + Ky*Fy) / (2*np.pi*T**2)
 
     if _g_fitness_kind == "kalman":
+        sigma_ph_cand = sigma_ph_from_K(Kz, Kx, Ky)
         try:
             A0p, B0p, ph0p, P_cov0p, _ = init_values(alp_comp, _g_Pexp, _g_poi)
         except Exception:
             return 1e6
         try:
             _, _, _, _, _, e, _ = kalmanFit_EKF(
-                alp_comp, _g_Pexp, T, _g_Q, P_cov0p, _g_sigma_A_sim, _g_sigma_ph,
+                alp_comp, _g_Pexp, T, _g_Q, P_cov0p, _g_sigma_A_sim, sigma_ph_cand,
                 A0p, B0p, ph0p)
         except Exception:
             return 1e6
@@ -959,10 +965,11 @@ def _kf_cell_worker(args):
     it, iz, ix, iy = args
     Kz = _g_Kz_vals[iz]; Kx = _g_Kx_vals[ix]; Ky = _g_Ky_vals[iy]
     alp_comp = _g_alp - (Kz*_g_Fz[it] + Kx*_g_Fx[it] + Ky*_g_Fy[it]) / (2*np.pi*_g_T**2)
+    sigma_ph_cand = sigma_ph_from_K(Kz, Kx, Ky)
     try:
         A0p, B0p, ph0p, P_cov0p, _ = init_values(alp_comp, _g_Pexp, _g_poi)
         _, _, _, _, _, e, _ = kalmanFit_EKF(
-            alp_comp, _g_Pexp, _g_T, _g_Q, P_cov0p, _g_sigma_A_sim, _g_sigma_ph,
+            alp_comp, _g_Pexp, _g_T, _g_Q, P_cov0p, _g_sigma_A_sim, sigma_ph_cand,
             A0p, B0p, ph0p)
         fit = float(np.std(e[_g_warmup:]))
     except Exception:
@@ -1034,9 +1041,10 @@ def full_grid_search_kalman_4d(alp, P_exp, az_m, ax_m, ay_m,
 
 def evaluate_with_kalman(tau, Kz, Kx, Ky, alp, P_exp, az_m, ax_m, ay_m):
     alp_comp = compensate_alp(tau, Kz, Kx, Ky, alp, az_m, ax_m, ay_m)
+    sigma_ph_cand = sigma_ph_from_K(Kz, Kx, Ky)
     A0e, B0e, ph0e, P_cov0e, _ = init_values(alp_comp, P_exp, poi)
     P_m, A, B, ph, P_cov, e, en = kalmanFit_EKF(
-        alp_comp, P_exp, T, Q, P_cov0e, sigma_A_sim, sigma_ph, A0e, B0e, ph0e)
+        alp_comp, P_exp, T, Q, P_cov0e, sigma_A_sim, sigma_ph_cand, A0e, B0e, ph0e)
     return alp_comp, ph, e, en
 
 def resolve_g_fringe_order(g_raw, g0_prior=G0_PRIOR):
