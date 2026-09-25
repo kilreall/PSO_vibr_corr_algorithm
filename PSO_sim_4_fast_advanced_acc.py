@@ -120,44 +120,16 @@ def kalmanFit_EKF(alp, P_exp, T, Q, P_cov0, sigma_A, sigma_ph, A0, B0, ph0):
 # с учётом ВЧ-фильтра акселерометра и связки с 1/(2T)
 # ============================================================
 #
-# Идея переписанной функции:
-#
-#  1) Вместо произвольной формулы 1/f^0.8 + один резонанс -- задаём
-#     ЦЕЛЕВУЮ одностороннюю ASD (амплитудную спектральную плотность)
-#     кусочно-линейно в log-log координатах, отдельно для каждой оси
-#     (x,y,z) и отдельно для двух состояний судна/платформы:
-#       state='mooring' -- стоянка (первая картинка: плато ~2e-4,
-#                           az заметно ниже ax/ay, горб ~3e-3 на ~4-6 Гц)
-#       state='sailing' -- ход/сильные вибрации (вторая картинка:
-#                           низкочастотное плато на порядок-два выше,
-#                           острый горб ~0.1-0.2 Гц до ~1.5e-1,
-#                           азимутальный порядок ax > az ~ ay на пике,
-#                           широкий шумный "хвост" 1-100 Гц с горбами
-#                           до ~1e-2, спад к ~1e-6 на 1 кГц)
-#     Узлы (f_nodes, asd_nodes) сняты "на глаз" по приложенным графикам;
-#     если есть оцифровка реальных кривых Qiao 2025 -- замените таблицы
-#     ниже, остальной код не меняется.
-#
-#  2) Реализация временного ряда с этой ASD строится методом случайных
-#     фаз (Timmer & Koenig): амплитуда rfft-компонент берётся из ASD,
-#     фаза -- случайная равномерная. Это даёт корректный масштаб именно
-#     как ASD [м/с^2/√Гц], а не произвольную нормировку std=1, как было
-#     раньше.
-#
-#  3) Поверх плавной формы накладываются узкополосные "линии" (для
-#     sailing -- машинные/роторные гармоники, которые на графике видны
-#     как острые пики в диапазоне 5-60 Гц).
-#
+#  1) ЦЕЛЕВАЯ одностороння ASD (амплитудная спектральная плотность)
+#     задаётся кусочно-линейно в log-log координатах, отдельно для каждой
+#     оси (x,y,z) и для двух состояний: 'mooring' (стоянка) и 'sailing'
+#     (ход, сильные вибрации).
+#  2) Реализация временного ряда строится методом случайных фаз
+#     (Timmer & Koenig) -- корректный масштаб именно как ASD [м/с^2/√Гц].
+#  3) Поверх плавной формы накладываются узкополосные "линии" (sailing).
 #  4) На выходе -- ВЧ-фильтр (Butterworth + filtfilt, нулевая фаза),
-#     имитирующий аппаратный HPF акселерометра/гравиметра, убирающий
-#     медленный дрейф самого датчика. Частота среза `hp_cutoff` -- явный
-#     параметр.
-#
-#  5) Параметр `f_low_phys` (обычно 1/(2T) -- частота, ниже которой
-#     окно чувствительности интерферометра fa(t) и так подавляет вклад
-#     вибрации) используется только как контроль: если hp_cutoff выше
-#     f_low_phys, функция предупреждает, что фильтр может резать полосу,
-#     всё ещё значимую для интерферометра.
+#     имитирующий аппаратный HPF акселерометра.
+#  5) f_low_phys (обычно 1/(2T)) -- только справочно.
 # ============================================================
 
 # --- таблицы ASD [м/с^2 / sqrt(Гц)], узлы по осям и состояниям -----------
@@ -181,27 +153,30 @@ _ASD_TABLES = {
         # для mooring выраженных узкополосных линий на графике нет
         'res_lines': [],
     },
+    # Значения откалиброваны по оцифровке рисунка (PSD для sailing).
+    # Это БАЗОВАЯ (сглаженная) кривая ДО умножения на узкополосные
+    # резонансные горбы res_lines (они добавляются кодом поверх).
     'sailing': {
-            'f_nodes': np.array([1e-3, 1e-2, 3e-2, 0.1, 0.15, 0.3, 0.6, 1.0,
-                                2.0, 4.0, 6.0, 10.0, 20.0, 40.0, 70.0, 100.0,
-                                200.0, 400.0, 1000.0]),
-            'axis': {
-                'x': np.array([2.0e-3, 3.5e-3, 5.5e-3, 9.0e-2, 1.0e-1, 4.0e-2,
-                            4.5e-3, 1.1e-3, 2.8e-4, 1.0e-4, 1.5e-4, 1.2e-4,
-                            6.0e-5, 5.0e-5, 4.0e-5, 3.0e-5, 4.0e-6, 4.0e-6,
-                            3.0e-7]),
-                'y': np.array([4.0e-4, 7.5e-4, 1.3e-3, 3.3e-2, 3.6e-2, 2.8e-2,
-                            3.2e-3, 9.5e-4, 2.2e-4, 1.2e-4, 1.6e-4, 1.0e-4,
-                            9.0e-5, 3.0e-5, 3.0e-5, 3.0e-5, 5.0e-6, 1.5e-5,
-                            1.5e-6]),
-                'z': np.array([1.2e-4, 1.3e-4, 5.0e-4, 1.0e-1, 1.9e-1, 2.7e-2,
-                            3.0e-3, 6.0e-4, 1.2e-4, 6.0e-5, 4.5e-4, 1.2e-3,
-                            1.0e-4, 8.0e-5, 8.0e-5, 2.0e-5, 8.0e-6, 1.0e-5,
-                            5.0e-7]),
-            },
-            'res_lines': [(6.0, 10, 1.2), (12.0, 12, 0.8), (24.0, 15, 0.5),
-                        (45.0, 15, 0.4)],
+        'f_nodes': np.array([1e-3, 1e-2, 3e-2, 0.1, 0.15, 0.3, 0.6, 1.0,
+                              2.0, 4.0, 6.0, 10.0, 20.0, 40.0, 70.0, 100.0,
+                              200.0, 400.0, 1000.0]),
+        'axis': {
+            'x': np.array([2.0e-3, 3.5e-3, 5.5e-3, 9.0e-2, 1.0e-1, 4.0e-2,
+                           4.5e-3, 1.1e-3, 2.8e-4, 1.0e-4, 1.5e-4, 1.2e-4,
+                           6.0e-5, 5.0e-5, 4.0e-5, 3.0e-5, 4.0e-6, 4.0e-6,
+                           3.0e-7]),
+            'y': np.array([4.0e-4, 7.5e-4, 1.3e-3, 3.3e-2, 3.6e-2, 2.8e-2,
+                           3.2e-3, 9.5e-4, 2.2e-4, 1.2e-4, 1.6e-4, 1.0e-4,
+                           9.0e-5, 3.0e-5, 3.0e-5, 3.0e-5, 5.0e-6, 1.5e-5,
+                           1.5e-6]),
+            'z': np.array([1.2e-4, 1.3e-4, 5.0e-4, 1.0e-1, 1.9e-1, 2.7e-2,
+                           3.0e-3, 6.0e-4, 1.2e-4, 6.0e-5, 4.5e-4, 1.2e-3,
+                           1.0e-4, 8.0e-5, 8.0e-5, 2.0e-5, 8.0e-6, 1.0e-5,
+                           5.0e-7]),
         },
+        'res_lines': [(6.0, 10, 1.2), (12.0, 12, 0.8), (24.0, 15, 0.5),
+                      (45.0, 15, 0.4)],
+    },
 }
 
 
@@ -237,78 +212,34 @@ def gen_vibration_trace(N, dt, axis='z', state='mooring', seed=None,
     Генерация одноосевой реализации вибрационного ускорения платформы,
     приближённой к измеренным ASD (Qiao 2025) для двух состояний.
 
-    ВАЖНО про физику (исправление по сравнению с предыдущей версией):
-    сенсорная (весовая) функция интерферометра fa(t) в частотной области
-    ведёт себя как НИЗКОЧАСТОТНЫЙ фильтр: её отклик МАКСИМАЛЕН на низких
-    частотах (вплоть до постоянной составляющей -- это и есть измеряемое
-    g) и убывает на частотах, больших ~1/T. Поэтому НЕ бысрые, а именно
-    МЕДЛЕННЫЕ вибрации (доли Гц -- единицы Гц, включая как раз пик
-    ~0.1-1 Гц на графиках mooring/sailing) дают наибольший вклад в ошибку
-    измерения g и требуют компенсации через Kz,Kx,Ky. f_low_phys=1/(2T)
-    здесь -- не порог, ниже которого сигнал "подавлен", а просто
-    характерный масштаб полосы/гребёнки отклика fa(t) (~1/T..1/2T),
-    для справки/логирования.
-
-    Отсюда следует, для чего нужен `hp_cutoff`: это НЕ способ убрать
-    "неважные" низкие частоты вибрации (они как раз важны и должны
-    остаться в сигнале для компенсации!), а имитация АППАРАТНОГО HPF
-    самого акселерометра/его согласующей электроники, убирающего
-    собственный, физически не связанный с реальной вибрацией платформы,
-    дрейф нуля и низкочастотный 1/f-шум датчика. Поэтому cutoff должен быть
-    ОЧЕНЬ низким (0.01 Гц или ниже) -- заведомо ниже пика 0.1-1 Гц,
-    чтобы не резать реальный вибрационный сигнал.
+    Физика: весовая функция интерферометра fa(t) ведёт себя как
+    НИЗКОЧАСТОТНЫЙ фильтр, поэтому именно МЕДЛЕННЫЕ вибрации (доли Гц --
+    единицы Гц) дают наибольший вклад в ошибку g и требуют компенсации
+    через Kz,Kx,Ky. hp_cutoff -- это имитация АППАРАТНОГО HPF самого
+    акселерометра (убирает дрейф нуля/1/f-шум датчика), поэтому он должен
+    быть очень низким (0.01 Гц или ниже), заведомо ниже пика 0.1-1 Гц.
 
     Параметры
     ---------
     N, dt        : длина реализации и шаг по времени
-    axis         : 'x' | 'y' | 'z' -- какую ось имитировать
-                   (в коде симуляции az соответствует 'z', ax -- 'x',
-                   ay -- 'y')
-    state        : 'mooring' -- стоянка/швартовка, спокойное состояние
-                    'sailing' -- ход, сильные вибрации
-    seed         : сид ГПСЧ (можно None -- тогда используется глобальный
-                   np.random через default_rng без фиксации)
-    hp_cutoff    : частота среза ВЧ-фильтра акселерометра [Гц] -- убирает
-                   только собственный дрейф датчика, держите её далеко
-                   ниже пика ASD (по умолчанию 0.01 Гц)
+    axis         : 'x' | 'y' | 'z'
+    state        : 'mooring' | 'sailing'
+    seed         : сид ГПСЧ (None -- без фиксации)
+    hp_cutoff    : частота среза ВЧ-фильтра акселерометра [Гц]
     hp_order     : порядок Баттерворта для HPF
-    f_low_phys   : контрольная частота (обычно 1/(2T)) -- только для
-                   информационного вывода; если hp_cutoff окажется
-                   опасно близко к полосе основного пика вибрации,
-                   выводится предупреждение (см. ниже)
-    aa_cutoff_factor : множитель к верхнему узлу ASD, задающий мягкий
-                   anti-alias спад (актуально при понижении fs)
-    platform_atten_db : ослабление [дБ] между "сырым" ускорением корпуса
-                   (то, что оцифровано с графика Qiao 2025) и ускорением,
-                   реально доходящим до чувствительной оси интерферометра
-                   через механическую изоляцию/подвес/сервоплатформу.
-                   ЭТО КЛЮЧЕВОЙ параметр: "сырые" значения ASD с графика
-                   (~1e-4..1.5e-1 м/с^2/√Гц) при умножении на keff и
-                   интегрировании с окном fa(t) дают фазовый вклад
-                   порядка ДЕСЯТКОВ ТЫСЯЧ радиан на один сброс (см. тест
-                   ниже) -- ни один поиск (Kz,Kx,Ky) с конечным шагом
-                   сетки не может разрешить такую фазу до нужной точности,
-                   отсюда "мусор" и систематические промахи по порядку
-                   фринджа даже для mooring. platform_atten_db переводит
-                   картину к масштабу, для которого рассчитаны
-                   алгоритмы компенсации в этом скрипте (по умолчанию
-                   -80 дБ, т.е. коэффициент 1e-4 по амплитуде -- это
-                   ПРИМЕРНАЯ, а не измеренная величина; если у вас есть
-                   паспортное значение изоляции вашей платформы --
-                   подставьте его сюда). При platform_atten_db=0 функция
-                   возвращает "сырую" вибрацию корпуса -- в этом режиме
-                   ожидаемо разваливается разрешение порядка фринджа
-                   (что и наблюдалось) -- это физически корректный
-                   результат, а не баг: значит для таких вибраций нужен
-                   не разовый поиск K по сетке, а быстрый адаптивный
-                   (например, непрерывный EKF/RLS) алгоритм оценки K.
+    f_low_phys   : контрольная частота (обычно 1/(2T)), справочно
+    aa_cutoff_factor : множитель к верхнему узлу ASD для anti-alias спада
+    platform_atten_db : ослабление [дБ] между "сырым" ускорением корпуса и
+                   ускорением на чувствительной оси интерферометра
+                   (изоляция/подвес/сервоплатформа). При 0 дБ -- "сырая"
+                   вибрация, фаза порядка тысяч радиан, порядок фринджа
+                   ожидаемо не разрешается.
     return_components : если True, вернуть ещё словарь
-                   {'raw', 'target_asd', 'freqs'} для контроля/отладки
+                   {'raw', 'target_asd', 'freqs'}
 
     Возвращает
     ----------
-    a(t) -- одноосевая реализация ускорения [м/с^2] после ослабления и HPF
-            (или (a(t), components), если return_components=True)
+    a(t) [м/с^2] после ослабления и HPF (или (a(t), components))
     """
     if axis not in ('x', 'y', 'z'):
         raise ValueError("axis must be 'x', 'y' or 'z'")
@@ -326,9 +257,6 @@ def gen_vibration_trace(N, dt, axis='z', state='mooring', seed=None,
     asd_nodes = table['axis'][axis]
     res_lines = table['res_lines']
 
-    # порог "опасной близости" hp_cutoff к полосе основного пика вибрации
-    # (а не к f_low_phys=1/(2T), которое к этому не имеет отношения) --
-    # ориентируемся на нижний узел таблицы, где начинается подъём к пику
     _danger_f = 0.05
     if hp_cutoff > _danger_f:
         print(f"[gen_vibration_trace] ВНИМАНИЕ: hp_cutoff={hp_cutoff} Гц "
@@ -336,8 +264,7 @@ def gen_vibration_trace(N, dt, axis='z', state='mooring', seed=None,
               f"сигнал (пик ASD лежит в районе 0.1-1 Гц) -- держите "
               f"cutoff в районе 0.01 Гц или ниже")
     if f_low_phys is not None:
-        pass  # f_low_phys -- справочно (масштаб полосы отклика fa(t)),
-              # не используется как порог отсечки реального сигнала
+        pass  # справочно
 
     log_target = np.interp(np.log10(freqs_safe),
                             np.log10(f_nodes), np.log10(asd_nodes))
@@ -346,20 +273,16 @@ def gen_vibration_trace(N, dt, axis='z', state='mooring', seed=None,
     for f0, q, rel_amp in res_lines:
         target_asd *= 1.0 + rel_amp * np.exp(-0.5*((freqs_safe - f0)/(f0/q))**2)
 
-    # --- ослабление "сырой" вибрации корпуса до уровня, доходящего до
-    #     чувствительной оси интерферометра (изоляция/подвес/сервоплатформа) ---
+    # --- ослабление "сырой" вибрации корпуса до уровня на оси интерферометра ---
     target_asd = target_asd * (10 ** (platform_atten_db / 20.0))
 
-    # мягкий anti-alias спад у верхнего узла (актуально, если понизите fs
-    # относительно текущей; сейчас fs очень высокая, эффекта почти нет)
+    # мягкий anti-alias спад у верхнего узла
     f_aa = f_nodes[-1] * aa_cutoff_factor
     target_asd *= 1.0 / (1.0 + (freqs_safe / f_aa)**6)
 
     raw = _synthesize_from_asd(freqs_safe, target_asd, N, fs, rng)
 
-    # --- ВЧ-фильтр акселерометра (убирает собственный медленный дрейф
-    #     датчика); zero-phase (filtfilt), чтобы не вносить временную
-    #     задержку в вибрационный сигнал ---
+    # --- ВЧ-фильтр акселерометра, zero-phase (filtfilt) ---
     wn = hp_cutoff / (fs/2)
     if 0 < wn < 1:
         b, a_f = butter(hp_order, wn, btype='high')
@@ -401,9 +324,7 @@ _trapz_w[0] *= 0.5
 _trapz_w[-1] *= 0.5
 weight_vec = fa_t * _trapz_w  # F_vib_axis(tau) = keff * K_axis * (a_window @ weight_vec)
 
-# частота, ниже которой окно fa(t) и так подавляет чувствительность
-# интерферометра к вибрации -- используется как контроль в
-# gen_vibration_trace (сравнение с hp_cutoff)
+# контрольная частота (справочно, см. gen_vibration_trace)
 F_LOW_PHYS = 1.0 / (2*T)
 
 
@@ -415,24 +336,14 @@ def simul_acc(N_sim, alp_amount, delay, Kz, Kx, Ky,
               vib_state='mooring', hp_cutoff=0.01, platform_atten_db=-80.0,
               seed_vib=None):
     """
-    vib_state : 'mooring' | 'sailing' -- какой профиль ASD вибрации
-                использовать (см. _ASD_TABLES / gen_vibration_trace)
-    hp_cutoff : частота среза ВЧ-фильтра акселерометра [Гц] -- держите
-                далеко ниже пика ASD (0.1-1 Гц), см. docstring
-                gen_vibration_trace
+    vib_state : 'mooring' | 'sailing' -- профиль ASD вибрации
+    hp_cutoff : частота среза ВЧ-фильтра акселерометра [Гц]
     platform_atten_db : ослабление [дБ] "сырой" вибрации корпуса до
-                уровня на чувствительной оси интерферометра -- см.
-                docstring gen_vibration_trace. При 0 дБ -- честная
-                "сырая" вибрация с графика, на которой этот скрипт
-                (грубые grid/PSO поиски Kz,Kx,Ky) заведомо не разрешит
-                порядок фринджа.
-    seed_vib  : базовый сид для генератора вибрации (None -- без
-                фиксации; для воспроизводимости передайте int)
+                уровня на чувствительной оси интерферометра
+    seed_vib  : базовый сид для генератора вибрации (None -- без фиксации)
     """
 
-    # --- диагностика масштаба: чему равен НЕСКОМПЕНСИРОВАННЫЙ (K=1)
-    #     фазовый вклад вибрации на один сброс, при заданном ослаблении,
-    #     и что было бы при "сырой" (0 дБ) вибрации корпуса ---
+    # --- диагностика масштаба: несжатый (K=1) фазовый вклад вибрации на сброс ---
     def _raw_phase_estimate(atten_db):
         probe = gen_vibration_trace(N_RP, t_step, axis='z', state=vib_state,
                                      hp_cutoff=hp_cutoff, platform_atten_db=atten_db)
@@ -452,8 +363,8 @@ def simul_acc(N_sim, alp_amount, delay, Kz, Kx, Ky,
 
     g0 = 9.8101507
     g_sim = np.zeros(N_sim); g_sim[-1] = g0
-    drift_corr = 3000
-    Dg_drift = 100e-8
+    drift_corr = 200
+    Dg_drift = 500e-8
     theta_drift = 1 - np.exp(-1.0/drift_corr)
     sigma_g_drift = Dg_drift * np.sqrt(theta_drift*(2 - theta_drift))
     print(f"sigma_g_drift = {sigma_g_drift}")
@@ -476,13 +387,12 @@ def simul_acc(N_sim, alp_amount, delay, Kz, Kx, Ky,
     sigma_a = 3e-5
 
     # суммарный фазовый шум от вибрации -- независимые вклады трёх осей
-    # складываются в квадратуре (та же формула распространения ошибки,
-    # что и в одноосевом случае, применённая к каждой оси и просуммированная)
+    # складываются в квадратуре, каждый со своим K
     sigma_ph_vibr = (keff * t_step * sigma_a * np.sqrt(np.sum(fa_t**2))
                       * np.sqrt(Kz**2 + Kx**2 + Ky**2))
     print(f"sigma_ph_vibr = {sigma_ph_vibr/keff/T/T*1e8} uGal")
 
-    A_sim = np.zeros(N_sim); A_sim[-1] = 0.15; dA_sim = 5e-3
+    A_sim = np.zeros(N_sim); A_sim[-1] = 0.15; dA_sim = 5e-3; DA_sim = 1.5e-4
     B_sim = np.zeros(N_sim); B_sim[-1] = 0.21; dB_sim = 5e-3
     ph_sim = np.zeros(N_sim)
     P_sim = np.zeros(N_sim)
@@ -495,8 +405,7 @@ def simul_acc(N_sim, alp_amount, delay, Kz, Kx, Ky,
         g_sim[i] = g0 + (g_sim[i-1] - g0)*(1 - theta_drift) + sigma_g_drift*np.random.normal()
         ph_sim[i] = keff*g_sim[i]*T*T
 
-        # три независимых сида на сброс (если seed_vib задан -- для
-        # воспроизводимости; иначе rng_vib сам крутит состояние дальше)
+        # три независимых сида на сброс (если seed_vib задан)
         seed_z = None if seed_vib is None else int(rng_vib.integers(0, 2**31 - 1))
         seed_x = None if seed_vib is None else int(rng_vib.integers(0, 2**31 - 1))
         seed_y = None if seed_vib is None else int(rng_vib.integers(0, 2**31 - 1))
@@ -529,13 +438,14 @@ def simul_acc(N_sim, alp_amount, delay, Kz, Kx, Ky,
         P_sim_noise[i] = P_sim[i] + np.random.normal(0, sigma_A_sim)
 
     dph_sim = sigma_g_drift*keff*T*T
+    dA_sim = np.sqrt(dA_sim**2 + DA_sim**2)
 
     return (alp, P_sim_noise, P_sim, A_sim, B_sim, g_sim, dA_sim, dB_sim, dph_sim,
             sigma_g_drift, sigma_ph_vibr, sigma_A_sim, az_m, ax_m, ay_m)
 
 
 # --- диапазоны поиска ---
-tau_range = [0, 1000]
+tau_range = [0, 5000]
 Kz_range = [0.7, 1.1]
 Kx_range = [0.0, 0.025]
 Ky_range = [0.0, 0.025]
@@ -568,6 +478,10 @@ GRID_KF_N_KX = 5
 GRID_KF_N_KY = 5
 
 N_JOBS = None
+
+# --- оконный cos-fit ---
+WIN_SIZE = 20      # None -> alp_amount (одно полное сканирование alp на окно)
+WIN_EDGES = None     # границы окон, задаются в __main__
 
 
 def compensate_alp(tau, Kz, Kx, Ky, alp, az_m, ax_m, ay_m):
@@ -652,6 +566,71 @@ def closed_form_cosfit_rms(c, s, y):
     return float(np.sqrt(RSS/N))
 
 
+# ============================================================
+# Оконный cos-fit (компенсация дрейфа A, B, g внутри серии)
+# ============================================================
+
+def make_windows(N, win):
+    """Непересекающиеся окна, покрывающие весь набор (остаток размазывается
+    по окнам, ничего не выбрасывается). Возвращает массив границ."""
+    n_win = max(1, N // win)
+    return np.linspace(0, N, n_win + 1).astype(int)
+
+
+def windowed_cosfit(phase, y, edges):
+    """
+    Независимый cos-fit в каждом окне. phase = 2*pi*alp_comp*T^2.
+    Модель A - B*cos(phase - ph) = A + c1*cos(phase) + c2*sin(phase),
+    решается через lstsq; ph = atan2(-c2, -c1).
+    Возвращает (общий RMS невязки по всем окнам, массив фаз ph по окнам).
+    """
+    c = np.cos(phase); s = np.sin(phase)
+    rss = 0.0
+    ph = np.empty(len(edges) - 1)
+    for k in range(len(edges) - 1):
+        sl = slice(edges[k], edges[k + 1])
+        X = np.column_stack((np.ones(edges[k + 1] - edges[k]), c[sl], s[sl]))
+        coef, *_ = np.linalg.lstsq(X, y[sl], rcond=None)
+        r = y[sl] - X @ coef
+        rss += float(r @ r)
+        ph[k] = np.arctan2(-coef[2], -coef[1])
+    return float(np.sqrt(rss / (edges[-1] - edges[0]))), ph
+
+
+def windowed_fitness(tau, Kz, Kx, Ky, alp, P_exp, az_m, ax_m, ay_m):
+    """Fitness для sequential-поиска: оконный cos-fit (сигнатура как у curvefit_fitness)."""
+    tau = int(np.clip(round(tau), tau_range[0], tau_range[1]))
+    Kz = float(np.clip(Kz, Kz_range[0], Kz_range[1]))
+    Kx = float(np.clip(Kx, Kx_range[0], Kx_range[1]))
+    Ky = float(np.clip(Ky, Ky_range[0], Ky_range[1]))
+    if tau + end > az_m.shape[1]:
+        return 1e6
+    try:
+        alp_comp = compensate_alp(tau, Kz, Kx, Ky, alp, az_m, ax_m, ay_m)
+        rms, _ = windowed_cosfit(2*np.pi*alp_comp*T**2, P_exp, WIN_EDGES)
+        return rms
+    except Exception:
+        return 1e6
+
+
+def windowed_g_error(alp_used, P_exp, g_sim, edges):
+    """
+    Оценка g по окнам (cos-fit в каждом окне) и её отклонение от g_sim.
+    Опорное значение окна -- среднее g_sim в этом окне (фит даёт усреднённую
+    по окну оценку). Порядок фринджа снимается через resolve_g_fringe_order.
+    Возвращает (g_win, dg_win, rms_dg, mean_dg).
+    """
+    _, ph = windowed_cosfit(2*np.pi*alp_used*T**2, P_exp, edges)
+    g_win = resolve_g_fringe_order(ph / keff / T**2)
+    g_ref = np.array([g_sim[edges[k]:edges[k + 1]].mean() for k in range(len(edges) - 1)])
+    dg = g_win - g_ref
+    return g_win, dg, float(np.sqrt(np.mean(dg**2))), float(np.mean(dg))
+
+
+# ============================================================
+# PSO
+# ============================================================
+
 def PSO(fitness_func, N_particles, M_iter, bounds, alp, P_exp, az_m, ax_m, ay_m):
     c1, c2, w = 2.0, 2.0, 0.9
     dim = len(bounds)
@@ -699,15 +678,17 @@ def PSO(fitness_func, N_particles, M_iter, bounds, alp, P_exp, az_m, ax_m, ay_m)
 
 
 def _pso_worker_init(alp_, P_exp_, az_m_, ax_m_, ay_m_, fitness_kind_,
-                      Q_, sigma_A_sim_, sigma_ph_, poi_, warmup_):
+                      Q_, sigma_A_sim_, sigma_ph_, poi_, warmup_, win_edges_=None):
     global _g_alp, _g_Pexp, _g_az_m, _g_ax_m, _g_ay_m, _g_fitness_kind
     global _g_Q, _g_sigma_A_sim, _g_sigma_ph, _g_poi, _g_warmup, _g_FFcache
+    global _g_winedges
     _g_alp, _g_Pexp = alp_, P_exp_
     _g_az_m, _g_ax_m, _g_ay_m = az_m_, ax_m_, ay_m_
     _g_fitness_kind = fitness_kind_
     _g_Q, _g_sigma_A_sim, _g_sigma_ph = Q_, sigma_A_sim_, sigma_ph_
     _g_poi, _g_warmup = poi_, warmup_
     _g_FFcache = {}
+    _g_winedges = win_edges_
 
 
 def _pso_get_FzFxFy(tau):
@@ -745,6 +726,13 @@ def _pso_particle_worker(x):
             return 1e6
         return float(np.std(e[_g_warmup:]))
 
+    elif _g_fitness_kind == "windowed":
+        try:
+            rms, _ = windowed_cosfit(2*np.pi*alp_comp*T**2, _g_Pexp, _g_winedges)
+            return rms
+        except Exception:
+            return 1e6
+
     else:  # "curvefit"
         try:
             p0 = [np.mean(_g_Pexp), (np.max(_g_Pexp) - np.min(_g_Pexp)) / 2, 0]
@@ -758,7 +746,7 @@ def _pso_particle_worker(x):
 
 
 def PSO_parallel(fitness_kind, N_particles, M_iter, bounds, alp, P_exp, az_m, ax_m, ay_m,
-                  n_jobs=None, warmup=50):
+                  n_jobs=None, warmup=50, win_edges=None):
     c1, c2, w = 2.0, 2.0, 0.9
     dim = len(bounds)
     n_jobs = n_jobs or mp.cpu_count()
@@ -784,7 +772,7 @@ def PSO_parallel(fitness_kind, N_particles, M_iter, bounds, alp, P_exp, az_m, ax
     with ctx.Pool(processes=n_jobs,
                    initializer=_pso_worker_init,
                    initargs=(alp, P_exp, az_m, ax_m, ay_m, fitness_kind,
-                             Q, sigma_A_sim, sigma_ph, poi, warmup)) as pool:
+                             Q, sigma_A_sim, sigma_ph, poi, warmup, win_edges)) as pool:
         for it in range(M_iter):
             fits = np.array(pool.map(_pso_particle_worker, pos, chunksize=1))
             n_calls += N_particles
@@ -811,6 +799,10 @@ def PSO_parallel(fitness_kind, N_particles, M_iter, bounds, alp, P_exp, az_m, ax
     Kz_opt, Kx_opt, Ky_opt = gbest[1], gbest[2], gbest[3]
     return tau_opt, Kz_opt, Kx_opt, Ky_opt, gbest_fit, history, n_calls
 
+
+# ============================================================
+# Координатный поиск
+# ============================================================
 
 def sequential_coordinate_search(fitness_func, alp, P_exp, az_m, ax_m, ay_m,
                                   tau_range, Kz_range, Kx_range, Ky_range,
@@ -869,13 +861,18 @@ def sequential_coordinate_search(fitness_func, alp, P_exp, az_m, ax_m, ay_m,
     return tau_cur, Kz_cur, Kx_cur, Ky_cur, best_fit, n_calls, history
 
 
+# ============================================================
+# Полная 4D-сетка: cos-fit (глобальный или оконный)
+# ============================================================
+
 def _cf_worker_init(az_m_, ax_m_, ay_m_, cosPhi0_, sinPhi0_, P_exp_,
-                     Kz_vals_, Kx_vals_, Ky_vals_):
+                     Kz_vals_, Kx_vals_, Ky_vals_, win_edges_=None):
     global _g_az_m, _g_ax_m, _g_ay_m, _g_cosPhi0, _g_sinPhi0, _g_Pexp
-    global _g_Kz_vals, _g_Kx_vals, _g_Ky_vals
+    global _g_Kz_vals, _g_Kx_vals, _g_Ky_vals, _g_winedges
     _g_az_m, _g_ax_m, _g_ay_m = az_m_, ax_m_, ay_m_
     _g_cosPhi0, _g_sinPhi0, _g_Pexp = cosPhi0_, sinPhi0_, P_exp_
     _g_Kz_vals, _g_Kx_vals, _g_Ky_vals = Kz_vals_, Kx_vals_, Ky_vals_
+    _g_winedges = win_edges_
 
 
 def _cf_row_worker(args):
@@ -884,20 +881,26 @@ def _cf_row_worker(args):
     Fx = keff * (_g_ax_m[:, tau:tau + end] @ weight_vec)
     Fy = keff * (_g_ay_m[:, tau:tau + end] @ weight_vec)
 
+    Phi0 = np.arctan2(_g_sinPhi0, _g_cosPhi0)   # нужен только для оконного режима
+
     row_fit = np.full((len(_g_Kz_vals), len(_g_Kx_vals), len(_g_Ky_vals)), 1e6)
     for iz, Kzv in enumerate(_g_Kz_vals):
         for ix, Kxv in enumerate(_g_Kx_vals):
             for iy, Kyv in enumerate(_g_Ky_vals):
                 ang = Kzv*Fz + Kxv*Fx + Kyv*Fy
-                c = _g_cosPhi0*np.cos(ang) + _g_sinPhi0*np.sin(ang)
-                s = _g_sinPhi0*np.cos(ang) - _g_cosPhi0*np.sin(ang)
-                row_fit[iz, ix, iy] = closed_form_cosfit_rms(c, s, _g_Pexp)
+                if _g_winedges is None:
+                    c = _g_cosPhi0*np.cos(ang) + _g_sinPhi0*np.sin(ang)
+                    s = _g_sinPhi0*np.cos(ang) - _g_cosPhi0*np.sin(ang)
+                    row_fit[iz, ix, iy] = closed_form_cosfit_rms(c, s, _g_Pexp)
+                else:
+                    row_fit[iz, ix, iy] = windowed_cosfit(Phi0 - ang, _g_Pexp, _g_winedges)[0]
     return it, tau, row_fit
 
 
 def full_grid_search_curvefit_4d(alp, P_exp, az_m, ax_m, ay_m,
                                   tau_range, Kz_range, Kx_range, Ky_range,
-                                  n_tau=21, n_Kz=11, n_Kx=5, n_Ky=5, n_jobs=None):
+                                  n_tau=21, n_Kz=11, n_Kx=5, n_Ky=5, n_jobs=None,
+                                  win_edges=None):
     tau_vals = np.unique(np.round(np.linspace(*tau_range, n_tau)).astype(int))
     Kz_vals = np.linspace(*Kz_range, n_Kz)
     Kx_vals = np.linspace(*Kx_range, n_Kx)
@@ -914,17 +917,18 @@ def full_grid_search_curvefit_4d(alp, P_exp, az_m, ax_m, ay_m,
     n_calls = int(len(tau_vals) * len(Kz_vals) * len(Kx_vals) * len(Ky_vals))
     n_jobs = n_jobs or mp.cpu_count()
 
-    print(f"  full_grid (cos-fit): {len(tau_vals)} строк x {n_Kz*n_Kx*n_Ky} ячеек, "
+    kind = "windowed cos-fit" if win_edges is not None else "cos-fit"
+    print(f"  full_grid ({kind}): {len(tau_vals)} строк x {n_Kz*n_Kx*n_Ky} ячеек, "
           f"{n_jobs} процессов")
     ctx = mp.get_context()
     with ctx.Pool(processes=n_jobs,
                    initializer=_cf_worker_init,
                    initargs=(az_m, ax_m, ay_m, cosPhi0, sinPhi0, P_exp,
-                             Kz_vals, Kx_vals, Ky_vals)) as pool:
+                             Kz_vals, Kx_vals, Ky_vals, win_edges)) as pool:
         tasks = list(enumerate(tau_vals))
         for it, tau, row_fit in pool.imap_unordered(_cf_row_worker, tasks):
             fitness[it] = row_fit
-            print(f"  full_grid (cos-fit): строка {it+1}/{len(tau_vals)} (tau={tau}) готова")
+            print(f"  full_grid ({kind}): строка {it+1}/{len(tau_vals)} (tau={tau}) готова")
 
     idx = np.unravel_index(np.argmin(fitness), fitness.shape)
     return (int(tau_vals[idx[0]]), float(Kz_vals[idx[1]]),
@@ -933,6 +937,10 @@ def full_grid_search_curvefit_4d(alp, P_exp, az_m, ax_m, ay_m,
             {"tau_vals": tau_vals, "Kz_vals": Kz_vals,
              "Kx_vals": Kx_vals, "Ky_vals": Ky_vals, "fitness": fitness})
 
+
+# ============================================================
+# Полная 4D-сетка: Kalman
+# ============================================================
 
 def _kf_worker_init(alp_, P_exp_, Fz_all_, Fx_all_, Fy_all_,
                      Kz_vals_, Kx_vals_, Ky_vals_, Q_, sigma_A_sim_, sigma_ph_,
@@ -1020,6 +1028,10 @@ def full_grid_search_kalman_4d(alp, P_exp, az_m, ax_m, ay_m,
              "Kx_vals": Kx_vals, "Ky_vals": Ky_vals, "fitness": fitness})
 
 
+# ============================================================
+# Оценка результата
+# ============================================================
+
 def evaluate_with_kalman(tau, Kz, Kx, Ky, alp, P_exp, az_m, ax_m, ay_m):
     alp_comp = compensate_alp(tau, Kz, Kx, Ky, alp, az_m, ax_m, ay_m)
     A0e, B0e, ph0e, P_cov0e, _ = init_values(alp_comp, P_exp, poi)
@@ -1050,7 +1062,6 @@ def resolve_g_fringe_order(g_raw, g0_prior=G0_PRIOR):
 
 def g_error_stats(ph, g_sim, warmup=50, bias_warn_threshold=1e-3):
     g_raw = ph / keff / T**2
-    #g_est = ph / keff / T**2
     g_est = resolve_g_fringe_order(g_raw)
     diff = g_est[warmup:] - g_sim[warmup:]
 
@@ -1091,35 +1102,28 @@ def nocomp_cosfit_g(alp, P_exp, g_sim):
 
 
 if __name__ == "__main__":
- 
+
     # --- выбор состояния вибрации и параметров ВЧ-фильтра акселерометра ---
-    VIB_STATE = 'sailing'         # 'mooring' или 'sailing'
-    HP_CUTOFF = 0.01              # Гц -- убирает только дрейф самого
-                                   # датчика, держите далеко ниже пика ASD
-    PLATFORM_ATTEN_DB = -0.0     # дБ -- ослабление "сырой" вибрации
-                                   # корпуса до уровня на чувствительной
-                                   # оси интерферометра (см. docstring
-                                   # gen_vibration_trace / simul_acc);
-                                   # поставьте 0.0, чтобы честно
-                                   # промоделировать "сырую" вибрацию
-                                   # с графика -- тогда grid/PSO поиски
-                                   # Kz,Kx,Ky ожидаемо перестанут
-                                   # разрешать порядок фринджа
- 
+    VIB_STATE = 'mooring'         # 'mooring' или 'sailing'
+    HP_CUTOFF = 0.01              # Гц -- убирает только дрейф самого датчика
+    PLATFORM_ATTEN_DB = -0.0      # дБ -- ослабление "сырой" вибрации корпуса
+                                  # до уровня на оси интерферометра;
+                                  # 0.0 -- честная "сырая" вибрация с графика
+
     N_sim = 1000
-    alp_amount = 201
-    delay = 500
+    alp_amount = 200
+    delay = 700
     Kz = 0.9
     Kx = 0.003
     Ky = 0.003
- 
+
     (alp, P_sim_noise, P_sim, A_sim, B_sim, g_sim, dA_sim, dB_sim, dph_sim,
      sigma_g_drift, sigma_ph_vibr, sigma_A_sim, az_m, ax_m, ay_m) = simul_acc(
         N_sim, alp_amount, delay, Kz, Kx, Ky,
         vib_state=VIB_STATE, hp_cutoff=HP_CUTOFF,
         platform_atten_db=PLATFORM_ATTEN_DB)
- 
-    # --- контроль сгенерированного профиля ASD (один реализация на ось) ---
+
+    # --- контроль сгенерированного профиля ASD (одна реализация на ось) ---
     a_check, dbg = gen_vibration_trace(N_RP, t_step, axis='z', state=VIB_STATE,
                                         hp_cutoff=HP_CUTOFF, f_low_phys=F_LOW_PHYS,
                                         platform_atten_db=PLATFORM_ATTEN_DB,
@@ -1129,17 +1133,23 @@ if __name__ == "__main__":
     plt.xlabel('Frequency, Hz'); plt.ylabel(r'ASD, m/s$^2$/$\sqrt{Hz}$')
     plt.title('Проверка целевого профиля ASD (генератор вибрации)')
     plt.legend(); plt.grid(True, which='both')
- 
+
     # kalman fit
     Q = np.diag([dA_sim**2, dB_sim**2, dph_sim**2])
     poi = alp_amount
+    poi = 100
     A0, B0, ph0, P_cov0, sigma_A = init_values(alp, P_sim_noise, poi)
     sigma_ph = np.sqrt(sigma_ph_vibr**2 + dph_sim**2*0)
     sigma_A = sigma_A_sim
- 
+
     warmup = 50
     results = {}
- 
+
+    # --- окна для оконного cos-fit ---
+    WIN_SIZE = alp_amount if WIN_SIZE is None else WIN_SIZE
+    WIN_EDGES = make_windows(N_sim, WIN_SIZE)
+    print(f"Окна для оконного cos-fit: {len(WIN_EDGES)-1} шт., границы = {WIN_EDGES.tolist()}")
+
     print("=== PSO with Kalman-filter fitness (4D: tau, Kz, Kx, Ky), параллельный + кэш ===")
     t0 = time.perf_counter()
     tau_kf, Kz_kf, Kx_kf, Ky_kf, fit_kf, hist_kf, calls_kf = PSO_parallel(
@@ -1148,7 +1158,7 @@ if __name__ == "__main__":
         alp, P_sim_noise, az_m, ax_m, ay_m,
         n_jobs=N_JOBS, warmup=warmup)
     results["PSO (Kalman)"] = (tau_kf, Kz_kf, Kx_kf, Ky_kf, time.perf_counter() - t0, calls_kf)
- 
+
     print("\n=== PSO with curve_fit fitness (4D), параллельный + кэш ===")
     t0 = time.perf_counter()
     tau_cf, Kz_cf, Kx_cf, Ky_cf, fit_cf, hist_cf, calls_cf = PSO_parallel(
@@ -1157,9 +1167,18 @@ if __name__ == "__main__":
         alp, P_sim_noise, az_m, ax_m, ay_m,
         n_jobs=N_JOBS)
     results["PSO (curve_fit)"] = (tau_cf, Kz_cf, Kx_cf, Ky_cf, time.perf_counter() - t0, calls_cf)
- 
+
+    print("\n=== PSO with WINDOWED cos-fit fitness (4D) ===")
+    t0 = time.perf_counter()
+    tau_w, Kz_w, Kx_w, Ky_w, fit_w, hist_w, calls_w = PSO_parallel(
+        "windowed", N_particles, M_iter,
+        [tau_range, Kz_range, Kx_range, Ky_range],
+        alp, P_sim_noise, az_m, ax_m, ay_m,
+        n_jobs=N_JOBS, win_edges=WIN_EDGES)
+    results["PSO (windowed cos-fit)"] = (tau_w, Kz_w, Kx_w, Ky_w, time.perf_counter() - t0, calls_w)
+
     seq_fitness_func = curvefit_fitness
- 
+
     print(f"\n=== Sequential coordinate search (tau -> Kz -> Kx -> Ky, "
           f"fitness = {seq_fitness_func.__name__}) ===")
     t0 = time.perf_counter()
@@ -1170,7 +1189,16 @@ if __name__ == "__main__":
         tau_init=SEQ_TAU_INIT, Kz_init=SEQ_KZ_INIT, Kx_init=SEQ_KX_INIT, Ky_init=SEQ_KY_INIT)
     results[f"Sequential ({seq_fitness_func.__name__})"] = (
         tau_sq, Kz_sq, Kx_sq, Ky_sq, time.perf_counter() - t0, calls_sq)
- 
+
+    print("\n=== Sequential coordinate search, windowed cos-fit ===")
+    t0 = time.perf_counter()
+    tau_sw, Kz_sw, Kx_sw, Ky_sw, fit_sw, calls_sw, hist_sw = sequential_coordinate_search(
+        windowed_fitness, alp, P_sim_noise, az_m, ax_m, ay_m,
+        tau_range, Kz_range, Kx_range, Ky_range,
+        n_tau=SEQ_N_TAU, n_Kz=SEQ_N_KZ, n_Kx=SEQ_N_KX, n_Ky=SEQ_N_KY, n_passes=SEQ_N_PASSES,
+        tau_init=SEQ_TAU_INIT, Kz_init=SEQ_KZ_INIT, Kx_init=SEQ_KX_INIT, Ky_init=SEQ_KY_INIT)
+    results["Sequential (windowed)"] = (tau_sw, Kz_sw, Kx_sw, Ky_sw, time.perf_counter() - t0, calls_sw)
+
     print("\n=== FULL 4D grid, closed-form cos-fit (coarse) ===")
     t0 = time.perf_counter()
     tau_g1, Kz_g1, Kx_g1, Ky_g1, fit_g1, calls_g1, hist_g1 = full_grid_search_curvefit_4d(
@@ -1179,7 +1207,16 @@ if __name__ == "__main__":
         n_tau=GRID_CF_N_TAU, n_Kz=GRID_CF_N_KZ, n_Kx=GRID_CF_N_KX, n_Ky=GRID_CF_N_KY,
         n_jobs=N_JOBS)
     results["Full grid (cos-fit)"] = (tau_g1, Kz_g1, Kx_g1, Ky_g1, time.perf_counter() - t0, calls_g1)
- 
+
+    print("\n=== FULL 4D grid, windowed cos-fit ===")
+    t0 = time.perf_counter()
+    tau_gw, Kz_gw, Kx_gw, Ky_gw, fit_gw, calls_gw, hist_gw = full_grid_search_curvefit_4d(
+        alp, P_sim_noise, az_m, ax_m, ay_m,
+        tau_range, Kz_range, Kx_range, Ky_range,
+        n_tau=GRID_CF_N_TAU, n_Kz=GRID_CF_N_KZ, n_Kx=GRID_CF_N_KX, n_Ky=GRID_CF_N_KY,
+        n_jobs=N_JOBS, win_edges=WIN_EDGES)
+    results["Full grid (windowed)"] = (tau_gw, Kz_gw, Kx_gw, Ky_gw, time.perf_counter() - t0, calls_gw)
+
     print("\n=== FULL 4D grid, Kalman fitness (very coarse) ===")
     t0 = time.perf_counter()
     tau_g2, Kz_g2, Kx_g2, Ky_g2, fit_g2, calls_g2, hist_g2 = full_grid_search_kalman_4d(
@@ -1188,16 +1225,16 @@ if __name__ == "__main__":
         n_tau=GRID_KF_N_TAU, n_Kz=GRID_KF_N_KZ, n_Kx=GRID_KF_N_KX, n_Ky=GRID_KF_N_KY,
         n_jobs=N_JOBS, warmup=warmup)
     results["Full grid (Kalman)"] = (tau_g2, Kz_g2, Kx_g2, Ky_g2, time.perf_counter() - t0, calls_g2)
- 
+
     # --- baseline: БЕЗ компенсации, через cos-fit (не через EKF: для
     #     Калмана вибрация без коррекции -- неучтённый шум) ---
     g_cf_nc, dg_cf_nc, _ = nocomp_cosfit_g(alp, P_sim_noise, g_sim)
- 
+
     print("\n===================================== Сравнение =====================================")
     print(f"{'':24s}{'tau':>7s}{'Kz':>9s}{'Kx':>10s}{'Ky':>10s}{'std(e)':>14s}"
           f"{'RMS_tot(g)':>14s}{'bias(g)':>13s}{'RMS_deb(g)':>14s}{'time,s':>10s}{'calls':>12s}")
     print(f"{'true':24s}{delay:7d}{Kz:9.4f}{Kx:10.5f}{Ky:10.5f}")
- 
+
     for label, (tau_v, Kz_v, Kx_v, Ky_v, t_v, n_calls_v) in results.items():
         alp_v, ph_v, e_v, en_v = evaluate_with_kalman(
             tau_v, Kz_v, Kx_v, Ky_v, alp, P_sim_noise, az_m, ax_m, ay_m)
@@ -1207,14 +1244,28 @@ if __name__ == "__main__":
     print(f"    g_cf          = {g_cf_nc:.9f} м/с^2")
     print(f"    g_sim[-1]     = {g_sim[-1]:.9f} м/с^2")
     print(f"    g_cf - g_sim[-1] = {dg_cf_nc*1e8:.3f} µGal")
+
+    # --- честное сравнение: и baseline, и все методы -- одним оконным cos-fit ---
+    print("\n---- Оконный cos-fit: g_win - <g_sim>_окна (µGal) ----")
+    print(f"{'':28s}{'RMS':>10s}{'mean':>10s}   по окнам")
+    _, dg0, rms0, m0 = windowed_g_error(alp, P_sim_noise, g_sim, WIN_EDGES)
+    print(f"{'No compensation':28s}{rms0*1e8:10.2f}{m0*1e8:10.2f}   "
+          + ", ".join(f"{d*1e8:.1f}" for d in dg0))
+    for label, (tau_v, Kz_v, Kx_v, Ky_v, t_v, n_calls_v) in results.items():
+        alp_c = compensate_alp(tau_v, Kz_v, Kx_v, Ky_v, alp, az_m, ax_m, ay_m)
+        _, dgc, rmsc, mc = windowed_g_error(alp_c, P_sim_noise, g_sim, WIN_EDGES)
+        print(f"{label:28s}{rmsc*1e8:10.2f}{mc*1e8:10.2f}   "
+              + ", ".join(f"{d*1e8:.1f}" for d in dgc))
+
     plt.figure()
     plt.plot(hist_kf, label="Kalman fitness")
     plt.plot(hist_cf, label="curve_fit fitness")
+    plt.plot(hist_w, label="windowed cos-fit fitness")
     plt.xlabel("PSO iteration")
     plt.ylabel("best fitness (своя шкала для каждого метода)")
-    plt.title(f"PSO convergence: Kalman vs curve_fit (4D), vib_state={VIB_STATE}")
+    plt.title(f"PSO convergence: Kalman vs curve_fit vs windowed (4D), vib_state={VIB_STATE}")
     plt.legend()
- 
+
     fig, axes = plt.subplots(1, 4, figsize=(16, 4))
     last_pass = SEQ_N_PASSES
     plot_specs = [
@@ -1231,7 +1282,7 @@ if __name__ == "__main__":
         ax.set_title(f"Координатный поиск: {name}")
         ax.legend()
     fig.tight_layout()
- 
+
     plt.figure()
     for label, (tau_v, Kz_v, Kx_v, Ky_v, t_v, n_calls_v) in results.items():
         _, _, e_v, _ = evaluate_with_kalman(tau_v, Kz_v, Kx_v, Ky_v, alp, P_sim_noise, az_m, ax_m, ay_m)
@@ -1240,7 +1291,7 @@ if __name__ == "__main__":
     plt.ylabel("EKF innovation e")
     plt.title(f"Итоговые невязки EKF при разных способах компенсации, vib_state={VIB_STATE}")
     plt.legend()
- 
+
     plt.figure()
     for label, (tau_v, Kz_v, Kx_v, Ky_v, t_v, n_calls_v) in results.items():
         _, ph_v, _, _ = evaluate_with_kalman(tau_v, Kz_v, Kx_v, Ky_v, alp, P_sim_noise, az_m, ax_m, ay_m)
@@ -1251,5 +1302,5 @@ if __name__ == "__main__":
     plt.ylabel(r"$g_{est} - g_{sim}$, µGal")
     plt.title(f"Ошибка определения g при разных способах компенсации, vib_state={VIB_STATE}")
     plt.legend()
- 
+
     plt.show()
