@@ -1068,10 +1068,22 @@ def resolve_g_fringe_order(g_raw, g0_prior=G0_PRIOR):
     return g_corr
 
 
-def g_error_stats(ph, g_sim, warmup=50, bias_warn_threshold=1e-3):
+def g_error_stats(ph, g_sim, warmup=50, n_tail=100, bias_warn_threshold=1e-3):
+    """
+    RMS/bias считаются ТОЛЬКО по последним n_tail точкам серии (а не по всему
+    хвосту после warmup). warmup по-прежнему используется как индекс, С КОТОРОГО
+    запускается цепочка resolve_g_fringe_order -- чтобы плохо сошедшиеся первые
+    точки фильтра не портили привязку 2π-неоднозначности для всех последующих
+    точек, включая финальные n_tail.
+    """
     g_raw = ph / keff / T**2
-    g_est = resolve_g_fringe_order(g_raw)
-    diff = g_est[warmup:] - g_sim[warmup:]
+    g_est_from_warmup = resolve_g_fringe_order(g_raw[warmup:], g0_prior=G0_PRIOR)
+
+    n_tail = min(n_tail, len(g_est_from_warmup))
+    g_est_tail = g_est_from_warmup[-n_tail:]
+    g_sim_tail = g_sim[-n_tail:]
+
+    diff = g_est_tail - g_sim_tail
 
     bias = np.median(diff)
     if abs(bias) > bias_warn_threshold:
@@ -1080,12 +1092,13 @@ def g_error_stats(ph, g_sim, warmup=50, bias_warn_threshold=1e-3):
 
     rms_debiased = np.sqrt(np.mean((diff - bias)**2))
     rms_total = np.sqrt(np.mean(diff**2))
-    return rms_total, rms_debiased, bias, g_est
+    return rms_total, rms_debiased, bias, g_est_tail
 
 
-def report_case(label, tau, Kz, Kx, Ky, ph_est, e_arr, g_sim, elapsed_s, n_calls, warmup=50):
+def report_case(label, tau, Kz, Kx, Ky, ph_est, e_arr, g_sim, elapsed_s, n_calls,
+                 warmup=50, n_tail=100):
     std_e = np.std(e_arr[warmup:])
-    rms_total, rms_debiased, bias_g, _ = g_error_stats(ph_est, g_sim, warmup=warmup)
+    rms_total, rms_debiased, bias_g, _ = g_error_stats(ph_est, g_sim, warmup=warmup, n_tail=n_tail)
     print(f"{label:24s}{tau:7d}{Kz:9.4f}{Kx:10.5f}{Ky:10.5f}{std_e:14.3e}"
           f"{rms_total*1e8:14.0f}{bias_g*1e8:13.0f}{rms_debiased*1e8:14.0f}"
           f"{elapsed_s:10.2f}{n_calls:12d}")
@@ -1150,7 +1163,7 @@ if __name__ == "__main__":
     sigma_ph = np.sqrt(sigma_ph_vibr**2 + dph_sim**2*0)
     sigma_A = sigma_A_sim
 
-    warmup = 50
+    warmup = 120
     results = {}
 
     # --- окна для оконного cos-fit ---
@@ -1243,10 +1256,14 @@ if __name__ == "__main__":
           f"{'RMS_tot(g)':>14s}{'bias(g)':>13s}{'RMS_deb(g)':>14s}{'time,s':>10s}{'calls':>12s}")
     print(f"{'true':24s}{delay:7d}{Kz:9.4f}{Kx:10.5f}{Ky:10.5f}")
 
+    N_TAIL = 800   # RMS_tot/bias/RMS_deb считаются только по последним N_TAIL точкам
+
     for label, (tau_v, Kz_v, Kx_v, Ky_v, t_v, n_calls_v) in results.items():
         alp_v, ph_v, e_v, en_v = evaluate_with_kalman(
             tau_v, Kz_v, Kx_v, Ky_v, alp, P_sim_noise, az_m, ax_m, ay_m)
-        report_case(label, tau_v, Kz_v, Kx_v, Ky_v, ph_v, e_v, g_sim, t_v, n_calls_v, warmup)
+        report_case(label, tau_v, Kz_v, Kx_v, Ky_v, ph_v, e_v, g_sim, t_v, n_calls_v,
+                    warmup=warmup, n_tail=N_TAIL)
+    
     print("-"*140)
     print(f"No compensation (cos-fit по всей серии, без Калмана):")
     print(f"    g_cf          = {g_cf_nc:.9f} м/с^2")
