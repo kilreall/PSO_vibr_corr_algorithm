@@ -1,3 +1,6 @@
+# скрипт для моделирования подбора коэф передаточной функции с 4-мя коэффициентами различными методами с продвинутой генерацией ускорения и с уксорением
+# через распараллеливание
+
 import time
 import multiprocessing as mp
 import numpy as np
@@ -394,7 +397,7 @@ def simul_acc(N_sim, alp_amount, delay, Kz, Kx, Ky,
                       * np.sqrt(Kz**2 + Kx**2 + Ky**2))
     print(f"sigma_ph_vibr = {sigma_ph_vibr/keff/T/T*1e8} uGal")
 
-    A_sim = np.zeros(N_sim); A_sim[-1] = 0.15; dA_sim = 5e-3; DA_sim = 1.5e-4
+    A_sim = np.zeros(N_sim); A_sim[-1] = 0.15; dA_sim = 5e-3; DA_sim = 1.5e-4*0
     B_sim = np.zeros(N_sim); B_sim[-1] = 0.21; dB_sim = 5e-3
     ph_sim = np.zeros(N_sim)
     P_sim = np.zeros(N_sim)
