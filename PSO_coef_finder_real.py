@@ -469,7 +469,7 @@ def main():
         Kz_bounds=(0.0, 1.5),
         # шаги блуждания модели фринджа (вручную)
         dA_model=5e-3, dB_model=5e-3, dph_model=1e-3,
-        poi=200, warmup=120, win_size=20,
+        poi=200, warmup=200, win_size=20,
         # шумы измерения в R:
         sigma_mode="auto",           # "auto" | "manual"
         # sigma_A=7e-3, sigma_ph=5e-3,   # нужны только для "manual"
