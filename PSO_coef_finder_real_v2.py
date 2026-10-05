@@ -472,17 +472,9 @@ def run_ekf(alp, y, x0, P0, qd, sA, sph, T, start):
 
 @njit(cache=True)
 def _fisher_core(e2, h, b, a, p, a_lo, p_lo, a_hi, p_hi, n_iter, tol):
-    """
-    Метод Фишера для (a, p) = (sigma_A^2, sigma_ph^2), S_k = h_k + a + b_k p.
-    Возвращает (a, p, I00, I01, I11) -- информация в итоговой точке.
-    При n_iter = 0 только считает информацию.
-    """
     for _ in range(n_iter):
-        g0 = 0.0
-        g1 = 0.0
-        I00 = 0.0
-        I01 = 0.0
-        I11 = 0.0
+        g0 = 0.0; g1 = 0.0
+        I00 = 0.0; I01 = 0.0; I11 = 0.0
         for k in range(e2.shape[0]):
             iS = 1.0 / (h[k] + a + b[k] * p)
             r = (e2[k] * iS - 1.0) * iS
@@ -492,26 +484,39 @@ def _fisher_core(e2, h, b, a, p, a_lo, p_lo, a_hi, p_hi, n_iter, tol):
             I00 += w
             I01 += b[k] * w
             I11 += b[k] * b[k] * w
-        det = I00 * I11 - I01 * I01
-        if not (det > 0.0):
-            break
-        da = (I11 * g0 - I01 * g1) / det
-        dp = (-I01 * g0 + I00 * g1) / det
 
-        step = 1.0
-        while step > 1e-3 and (a + step * da < a_lo or p + step * dp < p_lo):
-            step *= 0.5
-        a_new = min(max(a + step * da, a_lo), a_hi)
-        p_new = min(max(p + step * dp, p_lo), p_hi)
+        # координата на границе с градиентом наружу -- заморожена
+        act_a = (a <= a_lo * (1 + 1e-9) and g0 < 0.0) or (a >= a_hi * (1 - 1e-9) and g0 > 0.0)
+        act_p = (p <= p_lo * (1 + 1e-9) and g1 < 0.0) or (p >= p_hi * (1 - 1e-9) and g1 > 0.0)
+
+        if act_a and act_p:
+            break
+        elif act_p:
+            da = g0 / I00
+            dp = 0.0
+        elif act_a:
+            da = 0.0
+            dp = g1 / I11
+        else:
+            det = I00 * I11 - I01 * I01
+            if not (det > 1e-12 * I00 * I11):
+                # почти вырожденная информация: идём по координатам по отдельности
+                da = g0 / I00
+                dp = g1 / I11
+            else:
+                da = (I11 * g0 - I01 * g1) / det
+                dp = (-I01 * g0 + I00 * g1) / det
+
+        a_new = min(max(a + da, a_lo), a_hi)
+        p_new = min(max(p + dp, p_lo), p_hi)
         conv = abs(a_new - a) <= tol * a and abs(p_new - p) <= tol * p
         a = a_new
         p = p_new
         if conv:
             break
 
-    I00 = 0.0
-    I01 = 0.0
-    I11 = 0.0
+    # информация в итоговой точке -- без изменений
+    I00 = 0.0; I01 = 0.0; I11 = 0.0
     for k in range(e2.shape[0]):
         iS = 1.0 / (h[k] + a + b[k] * p)
         w = 0.5 * iS * iS
@@ -1196,7 +1201,7 @@ def main():
         dA_model=5e-3, dB_model=5e-3, dph_model=1e-3,   # начальная Q
         poi=200, warmup=200, win_size=20,
         tune_cfg=TuneCfg(sigma_init_mode="bins",
-                         tune_mode="alternate", r_method="fisher",
+                         tune_mode="alternate", r_method="grid",
                          q_optimizer="lbfgs",
                          n_outer=3, q_free=(True, True, True),
                          # q_log_bounds=(-12, -2),
