@@ -1,0 +1,2 @@
+1st_pulse_pos_int = 3988
+dt_sec = 2.048e-6
