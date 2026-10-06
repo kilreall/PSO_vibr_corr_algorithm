@@ -104,8 +104,16 @@ KEFF = 4*np.pi/LM
 N_RP = 16384
 
 # data init
-data = np.load(r"raw data export test\gravimeter_data.npz")
-alp, P_exp, az_m = data["alp"], data["P_exp"], data["az_m"]
+
+def load_q(path):
+    z = np.load(path)
+    q = np.concatenate([z["head"].astype(np.int64)[:, None],
+                        z["d"].astype(np.int64)], axis=1).cumsum(axis=1)
+    return z["alp"], z["P_exp"], q / float(z["scale"])
+
+# data = np.load(r"raw data export test\gravimeter_data.npz")
+# alp, P_exp, az_m = data["alp"], data["P_exp"], data["az_m"]
+alp, P_exp, az_m = load_q(r"raw data export test\gravimeter_data_q0.npz")
 T_RP = 33.556e-3
 
 
