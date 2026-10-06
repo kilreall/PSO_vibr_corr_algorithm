@@ -266,6 +266,34 @@ def initial_fit(alp, y, T):
     P0 = Jac @ cov_lin @ Jac.T
     return np.array([A, B, ph]), P0, res
 
+# =====================================================================
+# 4b. Перевод фазы фринджа в g и глобальный cos-fit
+# =====================================================================
+
+def g_per_rad(T):
+    """м/с^2 на 1 рад фазы фринджа: ph = KEFF * g * T^2."""
+    return 1.0 / (KEFF * T ** 2)
+
+
+def global_cosfit_stats(alp_comp, y, T):
+    """
+    Один cos-fit по всем данным (то же, что окно = N).
+    Возвращает dict: rms, B, dg_shot (на сброс), dg_total (по всем данным), м/с^2.
+    """
+    phase = 2 * np.pi * T ** 2 * alp_comp
+    X = np.column_stack((np.ones_like(phase), np.cos(phase), np.sin(phase)))
+    coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+    r = y - X @ coef
+    N = len(y)
+    A, c1, c2 = coef
+    B, ph = np.hypot(c1, c2), np.arctan2(-c2, -c1)
+    s = np.sqrt(float(r @ r) / (N - 3))
+    sens = B * np.sin(phase - ph)                     # dy/d(ph)
+    sigma_ph = s / np.sqrt(np.sum(sens ** 2))         # рад, по всем данным
+    k = g_per_rad(T)
+    return {"rms": float(np.sqrt(np.mean(r ** 2))), "B": float(B),
+            "dg_shot": sigma_ph * np.sqrt(N) * k, "dg_total": sigma_ph * k}
+
 
 # =====================================================================
 # 5. Стартовые sigma_A, sigma_ph (только для первого прогона EKF)
@@ -365,7 +393,7 @@ def start_sigmas(res, x0, alp, T, cfg):
 
 @njit(cache=True)
 def _ekf_core(alp, y, x0, P0, qd, sA2, sph2, two_pi_T2, start,
-              e_out, h_out, b_out, x_out):
+              e_out, h_out, b_out, x_out, p_out):
     """
     Прямой прогон EKF с сохранением траектории.
 
@@ -434,6 +462,7 @@ def _ekf_core(alp, y, x0, P0, qd, sA2, sph2, two_pi_T2, start,
         x_out[i, 0] = x[0]
         x_out[i, 1] = x[1]
         x_out[i, 2] = x[2]
+        p_out[i] = P[2, 2] 
 
         if i >= start:
             nll += np.log(S) + e * e / S
@@ -564,15 +593,13 @@ def _ekf_nll_grad(alp, y, x0, P0, qd, sA2, sph2, two_pi_T2, start,
 
 
 def run_ekf(alp, y, x0, P0, qd, sA, sph, T, start):
-    """Обёртка над _ekf_core. Возвращает dict с nll, cnt, e, h, b, x."""
+    """Обёртка над _ekf_core. Возвращает dict с nll, cnt, e, h, b, x, p22."""
     n = len(alp)
-    e = np.empty(n)
-    h = np.empty(n)
-    b = np.empty(n)
+    e, h, b, p = np.empty(n), np.empty(n), np.empty(n), np.empty(n)
     x = np.empty((n, 3))
     nll, cnt = _ekf_core(alp, y, x0, P0, qd, sA * sA, sph * sph,
-                         2 * np.pi * T * T, start, e, h, b, x)
-    return {"nll": nll, "cnt": cnt, "e": e, "h": h, "b": b, "x": x}
+                         2 * np.pi * T * T, start, e, h, b, x, p)
+    return {"nll": nll, "cnt": cnt, "e": e, "h": h, "b": b, "x": x, "p22": p}
 
 
 # =====================================================================
@@ -1019,6 +1046,8 @@ def _collect_diagnostics(r, w, sA, sph, q, sA_start, sph_start, src,
     # n_iter=0: оценка не меняется, нужны только стандартные ошибки
     _, _, sdA, sdP = fisher_R(e, h, b, sA, sph, tcfg, 0)
     S = h + sA ** 2 + b * sph ** 2
+ 
+
     return {
         "sigma_A": sA, "sigma_ph": sph, "sd_sigma_A": sdA, "sd_sigma_ph": sdP,
         "sigma_A_start": sA_start, "sigma_ph_start": sph_start,
@@ -1027,6 +1056,7 @@ def _collect_diagnostics(r, w, sA, sph, q, sA_start, sph_start, src,
         "q_at_bound": q_bound_hits(q, prm.q_init, idx, tcfg),
         "nu_stats": innovation_stats(e / np.sqrt(S), tcfg.n_lags),
         "states": r["x"],
+        "dg_sigma_ph": sph * g_per_rad(prm.T),      # шум фазы на сброс, м/с^2
     }
 
 
@@ -1152,8 +1182,8 @@ def _evaluate_particle(x):
 
     if _W["kind"] == "kalman":
         return ekf_fitness(Fz, Kz, _W["alp"], _W["P_exp"], _W["prm"], _W["tcfg"])
-    return windowed_fitness(Fz, Kz, _W["alp"], _W["P_exp"],
-                            _W["win_edges"], _W["prm"].T)
+    edges = _W["glob_edges"] if _W["kind"] == "global" else _W["win_edges"]
+    return windowed_fitness(Fz, Kz, _W["alp"], _W["P_exp"], edges, _W["prm"].T)
 
 
 def pso_parallel(kind, ctx, meta, n_particles, n_iter, n_jobs=None, seed=None,
@@ -1229,6 +1259,7 @@ def print_point(J, info, n_show_lags=5):
     print(f"  nu: rho[1..{n_show_lags}] = {rho_s}  (полоса +-{st['band']:.3f})")
     print(f"  nu: вне полосы {st['n_out_band']}/{len(st['rho'])} лагов, "
           f"Ljung-Box={st['ljung_box']:.1f}, p={st['lb_pvalue']:.3f}")
+    print(f"  шум фазы на сброс (sigma_ph): {info['dg_sigma_ph'] * UGAL:.3g} мкГал")
     if "grad_check" in info:
         g, g_fd = info["grad_check"]
         print("  проверка градиента (dJ/dlog10, аналитический / разностный / отн. ошибка):")
@@ -1236,6 +1267,45 @@ def print_point(J, info, n_show_lags=5):
             rel = abs(ga - gf) / max(abs(ga), abs(gf), 1e-12)
             print(f"    {name:9s}: {ga:+.6e}  {gf:+.6e}  {rel:.1e}")
 
+def print_glob(g):
+    print(f"  cos-fit по всем данным: RMS={g['rms']:.4e}, B={g['B']:.4f}, "
+          f"dg на сброс={g['dg_shot'] * UGAL:.3g} мкГал, "
+          f"dg по всем данным={g['dg_total'] * UGAL:.3g} мкГал")
+
+
+def print_comparison(results):
+    """Все найденные точки и K = 0, оценённые одними и теми же метриками."""
+    print("=== Итог (dg в мкГал) ===")
+    print(f"{'метод':9s}{'tau':>8s}{'Kz':>10s}{'J':>10s}{'RMS cos':>11s}"
+          f"{'dg cos':>8s}{'dg sig_ph':>10s}{'sigma_A':>10s}"
+          f"{'std(nu)':>8s}{'rho1':>8s}{'LB p':>8s}")
+    for name, r in results.items():
+        g = r["glob"]
+        row = f"{name:9s}{r['tau']:8.1f}{r['Kz']:10.2e}"
+        if "sigma_A" in r:
+            st = r["nu_stats"]
+            row += f"{r['J']:10.5f}"
+            row += f"{g['rms']:11.4e}{g['dg_total'] * UGAL:8.3g}"
+            row += f"{r['dg_sigma_ph'] * UGAL:10.3g}{r['sigma_A']:10.2e}"
+            row += f"{st['std']:8.3f}{st['rho'][0]:+8.3f}{st['lb_pvalue']:8.3f}"
+        else:
+            row += f"{'-':>10s}"
+            row += f"{g['rms']:11.4e}{g['dg_total'] * UGAL:8.3g}"
+            row += f"{'EKF не сошёлся':>46s}"
+        print(row)
+
+    base = results.get("baseline")
+    if base:
+        print("\nОтносительно K = 0 (меньше -- лучше):")
+        for name, r in results.items():
+            if name == "baseline":
+                continue
+            line = (f"  {name:9s}: RMS cos x{r['glob']['rms'] / base['glob']['rms']:.3f}"
+                    f", dg cos x{r['glob']['dg_total'] / base['glob']['dg_total']:.3f}")
+            if "sigma_A" in r and "sigma_A" in base:
+                line += (f", dJ={r['J'] - base['J']:+.4f}"
+                         f", sigma_ph x{r['sigma_ph'] / base['sigma_ph']:.3f}")
+            print(line)
 
 # =====================================================================
 # 15. Верхнеуровневая функция
@@ -1306,12 +1376,33 @@ def _run_q_init_check(Fz, Kz, alp, P_exp, prm, tcfg, J, factors):
     return checks
 
 
+def _evaluate_and_print(tau, Kz, table, meta, alp, P_exp, prm, tcfg,
+                        grad_check=False, q_init_check=()):
+    """Оценка точки (tau, Kz) по ВСЕМ данным: EKF (J, sigma, dg) и глобальный cos-fit."""
+    Fz = fz_lookup(table, tau, meta.tau_lo, meta.tau_step, len(alp))
+    J, info = tune_and_score(Fz, Kz, alp, P_exp, prm, tcfg,
+                             diagnostics=True, grad_check=grad_check)
+    glob = global_cosfit_stats(compensate_alp(alp, Fz, Kz, prm.T), P_exp, prm.T)
+    res = {"tau": tau, "Kz": Kz, "J": J, "glob": glob}
+
+    print(f"  итоговая оценка по всем данным (N={len(alp)}):")
+    print_glob(glob)
+    if not info:
+        print("  EKF не сошёлся в найденной точке\n")
+        return res
+    print_point(J, info)
+    res.update({k: v for k, v in info.items() if k != "states"})
+    res["Q_std"] = np.sqrt(info["q"])
+    if q_init_check:
+        res["q_init_check"] = _run_q_init_check(Fz, Kz, alp, P_exp, prm, tcfg,
+                                                J, q_init_check)
+    print()
+    return res
+
+
 def _run_stage(kind, title, ctx, meta, table, alp, P_exp, prm, tcfg, n_cols,
                n_particles, n_iter, n_jobs, seed, grad_check, q_init_check):
-    """
-    Один этап: PSO с критерием kind, затем итоговая оценка по всем данным.
-    Печатает ход работы, возвращает dict результатов для этого критерия.
-    """
+    """Один этап: PSO с критерием kind, затем итоговая оценка по всем данным."""
     print(f"=== PSO, {title} (tune_mode={tcfg.tune_mode}, "
           f"r_method={tcfg.r_method}, q_optimizer={tcfg.q_optimizer}, "
           f"N={n_cols}) ===")
@@ -1319,30 +1410,11 @@ def _run_stage(kind, title, ctx, meta, table, alp, P_exp, prm, tcfg, n_cols,
     tau, Kz, best, _, n_calls = pso_parallel(kind, ctx, meta, n_particles,
                                              n_iter, n_jobs, seed)
     dt = time.perf_counter() - t0
-
-    # итоговая оценка в найденной точке -- по ВСЕМ данным (не только n_pso)
-    Fz = fz_lookup(table, tau, meta.tau_lo, meta.tau_step, len(alp))
-    J, info = tune_and_score(Fz, Kz, alp, P_exp, prm, tcfg, diagnostics=True,
-                             grad_check=(grad_check and kind == "kalman"))
-    extra = "" if kind == "kalman" else f", RMS(win)={best:.4e}"
-    print(f"  -> tau={tau:.2f}, Kz={Kz:.5f}{extra} "
-          f"[{n_calls} вычислений, {dt:.1f} с]")
-    if not info:
-        print("  EKF не сошёлся в найденной точке\n")
-        return {"tau": tau, "Kz": Kz, "J": J}
-
-    print(f"  итоговая оценка по всем данным (N={len(alp)}):")
-    print_point(J, info)
-
-    res = {"tau": tau, "Kz": Kz, "J": J,
-           **{k: v for k, v in info.items() if k != "states"}}
-    res["Q_std"] = np.sqrt(info["q"])
-
-    if kind == "kalman" and q_init_check:
-        res["q_init_check"] = _run_q_init_check(Fz, Kz, alp, P_exp, prm, tcfg,
-                                                J, q_init_check)
-    print()
-    return res
+    extra = "" if kind == "kalman" else f", RMS={best:.4e}"
+    print(f"  -> tau={tau:.2f}, Kz={Kz:.5f}{extra} [{n_calls} вычислений, {dt:.1f} с]")
+    return _evaluate_and_print(tau, Kz, table, meta, alp, P_exp, prm, tcfg,
+                               grad_check=(grad_check and kind == "kalman"),
+                               q_init_check=q_init_check if kind == "kalman" else ())
 
 
 def fit_vibration_compensation(alp, P_exp, az_m, *,
@@ -1416,13 +1488,20 @@ def fit_vibration_compensation(alp, P_exp, az_m, *,
         n_cols = len(alp) if n_pso is None else n_pso
         ctx = dict(alp=alp[:n_cols], P_exp=P_exp[:n_cols], prm=prm, tcfg=tcfg,
                    win_edges=make_windows(n_cols, win_size),
+                   glob_edges=make_windows(n_cols, n_cols),      # <-- одно окно
                    tau_bounds=(float(meta.tau_lo), float(tau_hi_eff)),
                    Kz_bounds=Kz_bounds,
                    tau_lo=meta.tau_lo, tau_step=meta.tau_step, n_cols=n_cols)
 
-        # --- два критерия подряд ---
+        # --- без компенсации (Kz = 0; tau не влияет) ---
+        print("=== K = 0 (без компенсации) ===")
+        results["baseline"] = _evaluate_and_print(meta.tau_lo, 0.0, table, meta,
+                                                  alp, P_exp, prm, tcfg)
+
+        # --- три критерия подряд ---
         for kind, title in (("kalman", "fitness = NLL инноваций EKF"),
-                            ("windowed", "fitness = RMS оконного cos-fit")):
+                            ("windowed", f"fitness = RMS оконного cos-fit (окно {win_size})"),
+                            ("global", "fitness = RMS глобального cos-fit (одно окно)")):
             results[kind] = _run_stage(
                 kind, title, ctx, meta, table, alp, P_exp, prm, tcfg, n_cols,
                 n_particles, n_iter, n_jobs, seed, grad_check, q_init_check)
@@ -1468,16 +1547,7 @@ def main():
         grad_check=True,
         n_particles=30, n_iter=30, seed=0)
 
-    print("=== Итог ===")
-    for method, r in results.items():
-        if "sigma_A" not in r:
-            print(f"{method:9s}: tau={r['tau']:8.2f}  Kz={r['Kz']:.5f}  EKF не сошёлся")
-            continue
-        st = r["nu_stats"]
-        print(f"{method:9s}: tau={r['tau']:8.2f}  Kz={r['Kz']:.5f}  J={r['J']:.6e}  "
-              f"sigma_A={r['sigma_A']:.3e}  sigma_ph={r['sigma_ph']:.3e}  "
-              f"std(nu)={st['std']:.3f}  rho1={st['rho'][0]:+.3f}  "
-              f"LB p={st['lb_pvalue']:.3f}")
+    print_comparison(results)
 
 
 if __name__ == "__main__":
