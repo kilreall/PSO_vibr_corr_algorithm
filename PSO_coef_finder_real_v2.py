@@ -87,6 +87,7 @@ from scipy.stats import chi2 as chi2_dist
 LM = 780e-9                  # длина волны лазера, м
 KEFF = 4 * np.pi / LM        # эффективный волновой вектор, 1/м
 N_RP = 16384                 # отсчётов акселерометра на сброс (фиксировано аппаратурой)
+UGAL = 1e8
 
 # --- служебные значения ---
 BAD_FITNESS = 1e6            # fitness при сбое обработки точки (tau, Kz)
@@ -1450,8 +1451,8 @@ def main():
         T=10e-3,                    # длительность плеча, с
         ty=5.1e-6,                   # длительность импульса, с
         T_RP=33.556e-3,                 # запись акселерометра на сброс, с
-        tau_bounds=(0, 5000),       # отсчёты акселерометра
-        Kz_bounds=(0.0, 1.5),
+        tau_bounds=(0, 6590),       # отсчёты акселерометра
+        Kz_bounds=(-0.01, 0.01),
         dA_model=1e-3, dB_model=1e-3, dph_model=1e-3,   # начальная Q
         poi=200, warmup=200, win_size=20,
         tune_cfg=TuneCfg(sigma_init_mode="bins",

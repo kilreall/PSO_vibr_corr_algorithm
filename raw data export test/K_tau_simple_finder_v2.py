@@ -1,6 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize_scalar
+from scipy.ndimage import uniform_filter1d
+
 
 # sens func
 def fa(t, T, tau):
@@ -38,6 +40,9 @@ def vib_phase(az_m, delay, wvec, n):
     """Вибрационная фаза по сбросам, KEFF * integral(a*fa) dt (Симпсон). Среднее вычтено."""
     F = KEFF * (az_m[:, delay:delay + n] @ wvec)
     #F = F[np.random.permutation(len(F))] # случайное перемешивание
+    # hp_win = 31 # unifrom фильтр - позволяет вычесть плавный медленный дрейф по фазе
+    # if hp_win:
+    #     return F - uniform_filter1d(F, size=hp_win, mode="nearest")
     return F - F.mean()
 
 
@@ -269,3 +274,41 @@ def plot_fit(K, delay, alp, P_exp, az_m, T_RP, tau, T, n_show=None):
 diagnostics(delay_opt, alp, P_exp, az_m, T_RP, tau, T)
 plot_K_scan(delay_opt, alp, P_exp, az_m, T_RP, tau, T)
 plot_fit(K_opt, delay_opt, alp, P_exp, az_m, T_RP, tau, T, n_show=300)
+
+# погрешность опредения g
+
+def g_noise(phase, y, T):
+    """
+    Шум g по невязкам глобального cos-fit.
+    Возвращает dict: rms, B, dg_shot (на сброс), dg_total (по всем данным), м/с^2.
+    """
+    rms, A, B, ph = global_cosfit(phase, y)
+    N = len(y)
+    s = rms * np.sqrt(N / (N - 3))                       # несмещённое СКО невязок
+    sens = B * np.sin(phase - ph)                        # dy/d(ph) в каждой точке
+    sigma_ph = s / np.sqrt(np.sum(sens ** 2))            # рад, по всем данным
+    k = KEFF * T ** 2                                    # рад на (м/с^2)
+    return dict(rms=rms, B=B,
+                dg_shot=sigma_ph * np.sqrt(N) / k,
+                dg_total=sigma_ph / k)
+
+
+def print_dg(K, delay, alp, P_exp, az_m, T_RP, tau, T):
+    wvec, n = build_weight_vec(T, tau, T_RP / N_RP)
+    Fz = vib_phase(az_m, delay, wvec, n)
+    phase0 = 2 * np.pi * T ** 2 * alp
+
+    r0 = g_noise(phase0, P_exp, T)                       # без компенсации
+    r1 = g_noise(phase0 - K * Fz, P_exp, T)              # с компенсацией
+
+    UGAL = 1e8                                           # 1 м/с^2 = 1e8 мкГал
+    print(f"N = {len(P_exp)} сбросов, KEFF*T^2 = {KEFF * T ** 2:.1f} рад/(м/с^2)")
+    print(f"{'':28s}{'без комп.':>14s}{'после':>14s}{'отношение':>12s}")
+    print(f"{'RMS fit':28s}{r0['rms']:14.4e}{r1['rms']:14.4e}{r1['rms'] / r0['rms']:12.3f}")
+    print(f"{'B':28s}{r0['B']:14.4f}{r1['B']:14.4f}{r1['B'] / r0['B']:12.3f}")
+    for key, name in (("dg_shot", "dg на сброс"), ("dg_total", "dg по всем данным")):
+        print(f"{name + ', м/с^2':28s}{r0[key]:14.3e}{r1[key]:14.3e}{r1[key] / r0[key]:12.3f}")
+        print(f"{name + ', мкГал':28s}{r0[key] * UGAL:14.3e}{r1[key] * UGAL:14.3e}")
+
+
+print_dg(K_opt, delay_opt, alp, P_exp, az_m, T_RP, tau, T)
