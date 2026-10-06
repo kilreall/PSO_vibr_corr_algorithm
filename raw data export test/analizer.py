@@ -15,7 +15,7 @@ rcParams["legend.frameon"] = True
 data = np.loadtxt(f'raw data export test\data_T_10_ms_delay_200_ms.txt', delimiter=',', unpack=False, skiprows=0)
 alpha = data[:, 0]
 norm = data[:, 1]
-accel = data[:, 2:]/10
+accel = data[:, 2:]
 print(accel)
 
 # plot
