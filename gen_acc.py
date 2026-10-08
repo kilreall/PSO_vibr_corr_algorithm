@@ -1,48 +1,46 @@
 """
 vibration_gen.py
 =================
- 
-Функции генерации вибрационного ускорения платформы (mooring / sailing),
-выделенные из основного скрипта симуляции гравиметра, ЧТОБЫ можно было
-отдельно, без остального пайплайна (EKF, PSO, поиск Kz/Kx/Ky и т.д.),
-посмотреть:
- 
-  1) как выглядит сама реализация a(t) во времени;
-  2) её спектр (ASD, амплитудная спектральная плотность) и сравнение
-     с целевой (табличной) ASD, из которой она строится методом
-     случайных фаз (Timmer & Koenig);
-  3) спектрограмму (time-frequency picture), чтобы увидеть, как ведёт
-     себя сигнал во времени -- есть ли явно выраженные горбы/линии.
- 
-Логика самой генерации (таблицы ASD, метод случайных фаз, ВЧ-фильтр
-акселерометра, ослабление платформы) скопирована 1:1 из основного
-скрипта simul_acc.py -- здесь ничего не меняется по существу, только
-убрано всё, что не нужно для просмотра a(t) и её спектра.
- 
-ВАЖНО (исправление): (N, dt), с которыми раньше вызывался генератор в
-блоке __main__ (N=16384, T=33 мс), были взяты из основного пайплайна
-(параметры одного короткого высокочастотного измерительного окна EKF)
-и физически непригодны для того, чтобы увидеть спектр в диапазоне
-1e-3..1e3 Гц, который описывает таблица ASD и который показан на
-рисунке из статьи (Fig. 1): при T=33 мс частотное разрешение БПФ было
-Df = 1/T ~ 30 Гц, то есть вся структура ASD ниже ~30 Гц (провал у
-0.1-0.3 Гц, горб у 1-6 Гц) физически не могла присутствовать в
-сгенерированном сигнале. Теперь (N, dt) для демонстрационного графика
-подбираются автоматически функцией `suggest_grid()` исходя из
-диапазона f_nodes таблицы состояния (mooring/sailing), а не
-копируются из параметров EKF-окна.
+
+Основной скрипт генерации вибрационного ускорения платформы
+(mooring / sailing) по трём осям.
+
+Структура:
+
+  gen_vibration_trace()      -- одна ось, метод случайных фаз
+                                (Timmer & Koenig) по табличной ASD;
+  generate_vibration()       -- ОСНОВНАЯ ГЕНЕРАЦИЯ: по флагу state
+                                ('mooring' / 'sailing') возвращает
+                                ax, ay, az (+ служебную информацию);
+  plot_vibration_overview()  -- ОТРИСОВКА: принимает уже готовый a(t)
+                                (ничего не генерирует сама);
+  main                       -- вызывает generate_vibration(), затем
+                                передаёт результат в отрисовку.
+
+Чтобы использовать как библиотеку из другого скрипта:
+
+    from vibration_gen import generate_vibration
+    ax, ay, az, info = generate_vibration(state='sailing', N=..., dt=...)
+
+Ослабление платформы (platform_atten_db) убрано: сигнал строится ровно
+по табличной ASD (с учётом резонансных горбов res_lines и
+антиалиасингового спада) и ВЧ-фильтра акселерометра.
+
+Если N и dt не заданы, сетка подбирается автоматически функцией
+suggest_grid() под диапазон f_nodes таблицы выбранного состояния
+(N, dt из параметров короткого EKF-окна для просмотра спектра в диапазоне
+1e-3..1e3 Гц непригодны: Df = 1/T ~ 30 Гц при T=33 мс).
 """
- 
+
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import butter, filtfilt, welch, spectrogram
- 
- 
+
+
 # ============================================================
 # Таблицы ASD [м/с^2 / sqrt(Гц)], узлы по осям и состояниям
-# (скопировано без изменений из основного скрипта)
 # ============================================================
- 
+
 _ASD_TABLES = {
     'mooring': {
         'f_nodes': np.array([1e-3, 3e-2, 0.1, 0.3, 1.0, 2.0, 4.0, 6.0,
@@ -94,8 +92,12 @@ _ASD_TABLES = {
                       (45.0, 15, 0.4)],
     },
 }
- 
- 
+
+
+# ============================================================
+# Генерация одной оси
+# ============================================================
+
 def _synthesize_from_asd(freqs, target_asd, N, fs, rng):
     """
     Строит реализацию временного ряда с заданной ОДНОСТОРОННЕЙ
@@ -104,44 +106,45 @@ def _synthesize_from_asd(freqs, target_asd, N, fs, rng):
     """
     n_freq = len(freqs)
     amp = target_asd * np.sqrt(N * fs / 2.0)
- 
+
     phase = rng.uniform(0, 2*np.pi, n_freq)
     Xf = amp * np.exp(1j*phase)
- 
+
     Xf[0] = amp[0] * rng.normal() * np.sqrt(2.0)
     if N % 2 == 0:
         Xf[-1] = amp[-1] * rng.normal() * np.sqrt(2.0)
- 
+
     return np.fft.irfft(Xf, n=N)
- 
- 
+
+
 def gen_vibration_trace(N, dt, axis='z', state='mooring', seed=None,
                          hp_cutoff=0.01, hp_order=2,
                          f_low_phys=None, aa_cutoff_factor=1.0,
-                         platform_atten_db=-80.0,
                          return_components=False):
     """
     Генерация одноосевой реализации вибрационного ускорения платформы,
     приближённой к измеренным ASD (Qiao 2025) для состояний
-    'mooring' и 'sailing'. Подробности физики/параметров -- см. docstring
-    в основном скрипте симуляции (simul_acc.py); здесь код идентичен.
+    'mooring' и 'sailing'.
+
+    seed -- int, None или np.random.SeedSequence (всё, что принимает
+    np.random.default_rng).
     """
     if axis not in ('x', 'y', 'z'):
         raise ValueError("axis must be 'x', 'y' or 'z'")
     if state not in _ASD_TABLES:
         raise ValueError("state must be 'mooring' or 'sailing'")
- 
+
     rng = np.random.default_rng(seed)
     fs = 1.0 / dt
     freqs = np.fft.rfftfreq(N, d=dt)
     freqs_safe = freqs.copy()
     freqs_safe[0] = freqs_safe[1] * 0.5  # избегаем log(0)
- 
+
     table = _ASD_TABLES[state]
     f_nodes = table['f_nodes']
     asd_nodes = table['axis'][axis]
     res_lines = table['res_lines']
- 
+
     _danger_f = 0.05
     if hp_cutoff > _danger_f:
         print(f"[gen_vibration_trace] ВНИМАНИЕ: hp_cutoff={hp_cutoff} Гц "
@@ -150,74 +153,65 @@ def gen_vibration_trace(N, dt, axis='z', state='mooring', seed=None,
               f"cutoff в районе 0.01 Гц или ниже")
     if f_low_phys is not None:
         pass  # справочно, не используется как порог отсечки
- 
+
     log_target = np.interp(np.log10(freqs_safe),
                             np.log10(f_nodes), np.log10(asd_nodes))
     target_asd = 10 ** log_target
- 
+
     for f0, q, rel_amp in res_lines:
         target_asd *= 1.0 + rel_amp * np.exp(-0.5*((freqs_safe - f0)/(f0/q))**2)
- 
-    target_asd = target_asd * (10 ** (platform_atten_db / 20.0))
- 
+
     f_aa = f_nodes[-1] * aa_cutoff_factor
     target_asd *= 1.0 / (1.0 + (freqs_safe / f_aa)**6)
- 
+
     raw = _synthesize_from_asd(freqs_safe, target_asd, N, fs, rng)
- 
+
     wn = hp_cutoff / (fs/2)
     if 0 < wn < 1:
         b, a_f = butter(hp_order, wn, btype='high')
         a_trace = filtfilt(b, a_f, raw)
     else:
         a_trace = raw
- 
+
     if return_components:
         return a_trace, {'raw': raw, 'target_asd': target_asd, 'freqs': freqs_safe}
     return a_trace
- 
- 
+
+
 # ============================================================
 # Автоподбор сетки (N, dt) под диапазон f_nodes таблицы
 # ============================================================
- 
+
 def suggest_grid(state, low_res_factor=3.0, high_margin=2.5,
                   max_N=4_000_000, verbose=True):
     """
     Подбирает (N, dt), самосогласованные с диапазоном частот таблицы
-    ASD выбранного состояния (`state`), а не взятые "снаружи" (как
-    раньше -- из параметров совсем другого EKF-окна).
- 
+    ASD выбранного состояния (`state`).
+
     Требования:
       - Nyquist: fs = 1/dt должна быть заметно выше верхнего узла
-        таблицы f_max, иначе высокочастотная часть ASD (горб/спад
-        в районе десятков-сотен Гц) будет замэплена / обрезана.
-        Берём fs = high_margin * f_max (fs > 2*f_max гарантированно).
+        таблицы f_max. Берём fs = high_margin * f_max.
       - Частотное разрешение БПФ Df = 1/T = 1/(N*dt) должно быть
-        заметно МЕНЬШЕ нижнего узла таблицы f_min, иначе низкочастотная
-        структура (провал/горб у долей Гц, как на Fig. 1) просто не
-        попадёт ни в одну частотную ячейку. Берём
+        заметно МЕНЬШЕ нижнего узла таблицы f_min. Берём
         Df = f_min / low_res_factor.
- 
-    Так как таблица охватывает ~6 декад (1e-3..1e3 Гц), "честное" N
-    получается очень большим (миллионы-десятки миллионов отсчётов).
-    Если оно превышает `max_N`, N обрезается до max_N, fs сохраняется
-    (чтобы не потерять высокочастотную часть), а достигнутое разрешение
-    Df оказывается хуже желаемого -- об этом печатается предупреждение.
- 
+
+    Если "честное" N превышает `max_N`, N обрезается до max_N, fs
+    сохраняется, а достигнутое разрешение Df оказывается хуже
+    желаемого -- об этом печатается предупреждение.
+
     Возвращает dict с полями N, dt, fs, T, df, f_min, f_max, warning.
     """
     if state not in _ASD_TABLES:
         raise ValueError("state must be 'mooring' or 'sailing'")
- 
+
     f_nodes = _ASD_TABLES[state]['f_nodes']
     f_min, f_max = f_nodes[0], f_nodes[-1]
- 
+
     fs = high_margin * f_max
     df_target = f_min / low_res_factor
     T_target = 1.0 / df_target
     N_target = int(np.ceil(T_target * fs))
- 
+
     warning = None
     N = N_target
     if N_target > max_N:
@@ -234,73 +228,130 @@ def suggest_grid(state, low_res_factor=3.0, high_margin=2.5,
             f"{df_actual*3:.3g} Гц и ниже может быть недостоверна/усреднена. "
             f"Поднимите max_N, если нужна более честная картина у 1e-3..1e-2 Гц."
         )
- 
+
     dt = 1.0 / fs
     T = N * dt
     df = 1.0 / T
- 
+
     info = dict(N=N, dt=dt, fs=fs, T=T, df=df, f_min=f_min, f_max=f_max,
                 warning=warning)
- 
+
     if verbose:
         print(f"[suggest_grid:{state}] N={N:,}, dt={dt:.3e} с, fs={fs:.1f} Гц, "
               f"T={T:.1f} с, Df={df:.3g} Гц (диапазон таблицы "
               f"{f_min:g}..{f_max:g} Гц)")
         if warning:
             print(warning)
- 
+
     return info
- 
- 
+
+
 # ============================================================
-# Визуальный контроль: временной ряд + спектр (ASD) + спектрограмма
+# ОСНОВНАЯ ГЕНЕРАЦИЯ: по флагу state -> ax, ay, az
 # ============================================================
- 
-def plot_vibration_overview(N=None, dt=None, axis='z', state='mooring', seed=42,
-                             hp_cutoff=0.01, platform_atten_db=-80.0,
-                             nperseg_frac=8, grid_kwargs=None):
+
+def generate_vibration(state, N_RP, T_RP, seed=42,
+                        hp_cutoff=0.01, hp_order=2,
+                        aa_cutoff_factor=1.0, N_sim=1):
     """
-    Строит для одной реализации a(t):
+    Генерирует вибрационное ускорение по трём осям для выбранного
+    состояния платформы на сетке окна пайплайна.
+
+    Параметры
+    ---------
+    state : 'mooring' | 'sailing'
+        Флаг состояния -- определяет таблицу ASD и резонансные горбы.
+    N_RP : int
+        Число отсчётов в одном окне.
+    T_RP : float
+        Длительность одного окна, с. Шаг сетки dt = T_RP / N_RP.
+    seed : int | None
+        Базовый seed. Для осей x, y, z из него порождаются независимые
+        дочерние потоки (SeedSequence.spawn), поэтому оси
+        некоррелированы между собой, но результат воспроизводим.
+    hp_cutoff, hp_order, aa_cutoff_factor
+        Параметры ВЧ-фильтра акселерометра и антиалиасингового спада
+        (пробрасываются в gen_vibration_trace).
+    N_sim : int
+        Число подряд идущих окон. Общая длина реализации
+        N = N_sim * N_RP (по умолчанию одно окно).
+
+    Возвращает
+    ----------
+    ax, ay, az : np.ndarray  -- ускорения по осям, м/с^2
+    info : dict
+        state, N, dt, fs, t (вектор времени), hp_cutoff и
+        'dbg' = {'x': {...}, 'y': {...}, 'z': {...}} с целевой ASD
+        (target_asd, freqs, raw) для каждой оси.
+    """
+    if state not in _ASD_TABLES:
+        raise ValueError("state must be 'mooring' or 'sailing'")
+
+    dt = T_RP / N_RP
+    N = int(N_sim) * int(N_RP)
+    fs = 1.0 / dt
+
+    f_max = _ASD_TABLES[state]['f_nodes'][-1]
+    if fs / 2.0 < f_max:
+        print(f"[generate_vibration] ВНИМАНИЕ: fs/2={fs/2:.3g} Гц ниже "
+              f"верхнего узла таблицы {f_max:g} Гц -- ВЧ-часть ASD "
+              f"будет обрезана по Найквисту")
+
+    child_seeds = np.random.SeedSequence(seed).spawn(3)
+
+    traces, dbgs = {}, {}
+    for ax_name, ss in zip(('x', 'y', 'z'), child_seeds):
+        traces[ax_name], dbgs[ax_name] = gen_vibration_trace(
+            N, dt, axis=ax_name, state=state, seed=ss,
+            hp_cutoff=hp_cutoff, hp_order=hp_order,
+            aa_cutoff_factor=aa_cutoff_factor,
+            return_components=True)
+
+    info = dict(state=state, N=N, dt=dt, fs=fs,
+                t=np.arange(N) * dt, hp_cutoff=hp_cutoff, dbg=dbgs)
+    return traces['x'], traces['y'], traces['z'], info
+
+
+# ============================================================
+# ОТРИСОВКА: принимает уже готовые данные, ничего не генерирует
+# ============================================================
+
+def plot_vibration_overview(a_t, info, axis, nperseg_frac=8):
+    """
+    Строит для готовой реализации a(t) одной оси:
       - временной ряд;
       - целевую ASD (табличную, по которой строился сигнал) и
-        Welch-оценку ASD по самой реализации -- для проверки, что
-        сгенерированный сигнал действительно соответствует таблице;
+        Welch-оценку ASD по самой реализации;
       - спектрограмму (time-frequency picture).
- 
-    Если N и dt не заданы явно, они подбираются автоматически функцией
-    `suggest_grid(state, ...)` -- под диапазон f_nodes данного состояния,
-    а не берутся "снаружи" из параметров другого окна/пайплайна.
-    `grid_kwargs` -- доп. параметры, передаваемые в suggest_grid
-    (low_res_factor, high_margin, max_N).
+
+    Параметры
+    ---------
+    a_t  : np.ndarray -- ускорение одной оси (из generate_vibration).
+    info : dict       -- словарь info, возвращённый generate_vibration.
+    axis : 'x' | 'y' | 'z' -- какая это ось (для подписей и выбора
+           целевой ASD из info['dbg']).
     """
-    if N is None or dt is None:
-        grid = suggest_grid(state, **(grid_kwargs or {}))
-        N, dt = grid['N'], grid['dt']
- 
-    a_t, dbg = gen_vibration_trace(N, dt, axis=axis, state=state, seed=seed,
-                                    hp_cutoff=hp_cutoff,
-                                    platform_atten_db=platform_atten_db,
-                                    return_components=True)
-    fs = 1.0 / dt
-    t = np.arange(N) * dt
- 
-    # nperseg для Welch/спектрограммы: не может быть больше N; стараемся
-    # не мельчить сегмент сильнее, чем нужно для разумного усреднения,
-    # но и не терять частотное разрешение у нижних узлов таблицы.
+    state = info['state']
+    N, dt, fs, t = info['N'], info['dt'], info['fs'], info['t']
+    dbg = info['dbg'][axis]
+
+    # nperseg для Welch/спектрограммы: не больше N; не мельчим сегмент
+    # сильнее, чем нужно для усреднения, и не теряем разрешение у
+    # нижних узлов таблицы.
     nperseg = int(np.clip(N // nperseg_frac, 1024, N))
     f_welch, Pxx = welch(a_t, fs=fs, nperseg=nperseg)
     asd_welch = np.sqrt(Pxx)
- 
+
     f_spec, t_spec, Sxx = spectrogram(a_t, fs=fs, nperseg=nperseg,
                                        noverlap=nperseg // 2)
- 
+
     fig, axs = plt.subplots(1, 3, figsize=(16, 4.5))
- 
+
     axs[0].plot(t, a_t, lw=0.6)
     axs[0].set_xlabel('t, с')
     axs[0].set_ylabel(r'a, м/с$^2$')
-    axs[0].set_title(f'Временной ряд: {axis}, {state}')
- 
+    axs[0].set_title(f'Временной ряд: a{axis}, {state}')
+
     axs[1].loglog(dbg['freqs'], dbg['target_asd'], 'k--', lw=1.5, label='target ASD')
     axs[1].loglog(f_welch, asd_welch, alpha=0.75, label='Welch-оценка по a(t)')
     axs[1].set_xlabel('f, Гц')
@@ -308,7 +359,7 @@ def plot_vibration_overview(N=None, dt=None, axis='z', state='mooring', seed=42,
     axs[1].set_title('Спектр (ASD)')
     axs[1].legend()
     axs[1].grid(True, which='both', alpha=0.3)
- 
+
     im = axs[2].pcolormesh(t_spec, f_spec, 10*np.log10(Sxx + 1e-30), shading='auto')
     axs[2].set_yscale('log')
     axs[2].set_ylim(max(f_spec[1], 1e-3), fs/2)
@@ -316,36 +367,61 @@ def plot_vibration_overview(N=None, dt=None, axis='z', state='mooring', seed=42,
     axs[2].set_ylabel('f, Гц')
     axs[2].set_title('Спектрограмма')
     fig.colorbar(im, ax=axs[2], label='дБ')
- 
+
     fig.suptitle(f'axis={axis}, state={state}, N={N}, dt={dt:.3e} с, '
-                 f'hp_cutoff={hp_cutoff} Гц, platform_atten_db={platform_atten_db} дБ')
+                 f'hp_cutoff={info["hp_cutoff"]} Гц')
     fig.tight_layout()
-    return fig, a_t, dbg
- 
- 
-if __name__ == "__main__":
-    # (N, dt) больше НЕ берутся из параметров EKF-окна основного скрипта
-    # (N_RP=16384, T_RP=33e-3) -- та сетка была рассчитана для другой
-    # задачи и физически не могла показать спектр ниже ~30 Гц.
-    # Вместо этого сетка подбирается автоматически под таблицу ASD
-    # каждого состояния функцией suggest_grid().
- 
+    return fig
+
+
+# ============================================================
+# main
+# ============================================================
+
+def main():
+    # ---------------- настройки ----------------
+    STATE = 'sailing'      # флаг состояния: 'mooring' или 'sailing'
+    SEED = 42
     HP_CUTOFF = 0.01
-    PLATFORM_ATTEN_DB = 0.0   # поставьте -80.0, чтобы увидеть "ослабленный"
-                              # сигнал, который реально используется
-                              # в simul_acc.py по умолчанию
- 
-    # max_N=4_000_000 -- разумный компромисс между честным разрешением
-    # у нижних узлов таблицы (~1e-3 Гц) и временем/памятью на irfft +
-    # filtfilt. При необходимости увеличьте, если позволяют ресурсы.
-    GRID_KWARGS = dict(low_res_factor=3.0, high_margin=2.5, max_N=4_000_000)
- 
-    for state in ('mooring', 'sailing'):
-        grid = suggest_grid(state, **GRID_KWARGS)
-        for axis in ('x', 'y', 'z'):
-            plot_vibration_overview(N=grid['N'], dt=grid['dt'], axis=axis,
-                                     state=state, seed=42,
-                                     hp_cutoff=HP_CUTOFF,
-                                     platform_atten_db=PLATFORM_ATTEN_DB)
- 
-    plt.show()
+
+    # --- сетка ---
+    # Сетка берётся из параметров окна пайплайна:
+    #        N = N_SIM * N_RP,  dt = T_RP / N_RP.
+    # USE_RP_GRID = True дополнительно нарезает результат на окна
+    # по N_RP отсчётов (info['windows']).
+    USE_RP_GRID = False
+    N_RP = 16384           # отсчётов в одном окне
+    T_RP = 33e-3           # длительность одного окна, с
+    N_SIM = 10             # число подряд идущих окон по N_RP отсчётов
+
+    DO_PLOT = True
+    # -------------------------------------------
+
+    # 1) ОСНОВНАЯ ГЕНЕРАЦИЯ
+    ax, ay, az, info = generate_vibration(
+        STATE, N_RP, T_RP, seed=SEED,
+        hp_cutoff=HP_CUTOFF, N_sim=N_SIM)
+
+    # Нарезка на окна по N_RP отсчётов: windows[axis][i] -- i-е окно
+    if USE_RP_GRID:
+        info['N_RP'], info['N_sim'] = N_RP, N_SIM
+        info['windows'] = {k: a.reshape(N_SIM, N_RP)
+                           for k, a in (('x', ax), ('y', ay), ('z', az))}
+
+    print(f"Сгенерировано: state={info['state']}, N={info['N']:,}, "
+          f"dt={info['dt']:.3e} с, T={info['N']*info['dt']:.3g} с"
+          + (f", окон N_sim={N_SIM} x N_RP={N_RP}" if USE_RP_GRID else ""))
+    print(f"  RMS ax={np.std(ax):.3e}, ay={np.std(ay):.3e}, "
+          f"az={np.std(az):.3e} м/с^2")
+
+    # 2) ОТРИСОВКА (получает уже готовые ax, ay, az)
+    if DO_PLOT:
+        for axis_name, a_t in (('x', ax), ('y', ay), ('z', az)):
+            plot_vibration_overview(a_t, info, axis_name)
+        plt.show()
+
+    return ax, ay, az, info
+
+
+if __name__ == "__main__":
+    main()
