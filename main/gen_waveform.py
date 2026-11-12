@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-from gen_acc import generate_vibration
+from main.gen_acc import generate_vibration
 
 # constants
 lm = 780e-9
@@ -26,7 +26,7 @@ def sens_integral(delay, a, end, weight_vec):
     return keff * float(seg @ weight_vec)
 
 
-def simul_wavefrom(N_sim, alp_amount, T_RP, T, tau, delay, Kz, Kx, Ky, vib_state, sigma_a, Dph_drift, drift_corr, sigma_A_sim, sigma_ph_sim, dA_sim, dB_sim, DA_sim):
+def simul_wavefrom(N_sim, alp_amount, T_RP, T, tau, delay, Kz, Kx, Ky, vib_state, sigma_a, Dph_drift, drift_corr, sigma_A_sim, sigma_ph_sim, dA_sim, dB_sim, DA_sim, vib_seed=42):
     #params
     fat_v = np.vectorize(fa, otypes=[float])
     t_step = T_RP/N_RP
@@ -43,6 +43,7 @@ def simul_wavefrom(N_sim, alp_amount, T_RP, T, tau, delay, Kz, Kx, Ky, vib_state
     g0 = 9.8125
     ph0 = g0*keff*T**2
     ph_sim = np.zeros(N_sim); ph_sim[-1] = ph0
+    ph_sim_noise = np.zeros(N_sim)
     theta_drift = 1 - np.exp(-1.0/drift_corr)
     sigma_ph_drift = Dph_drift * np.sqrt(theta_drift*(2 - theta_drift))
 
@@ -59,7 +60,7 @@ def simul_wavefrom(N_sim, alp_amount, T_RP, T, tau, delay, Kz, Kx, Ky, vib_state
     F_viby = np.zeros(N_sim)
 
     ax_m, ay_m, az_m, info = generate_vibration(
-        vib_state, N_RP, T_RP, seed=42,
+        vib_state, N_RP, T_RP, seed=vib_seed,
         hp_cutoff=0.01, N_sim=N_sim)
     ax_m = ax_m.reshape(N_sim, N_RP)
     ay_m = ay_m.reshape(N_sim, N_RP)
@@ -75,7 +76,8 @@ def simul_wavefrom(N_sim, alp_amount, T_RP, T, tau, delay, Kz, Kx, Ky, vib_state
 
     for i in range(N_sim):
 
-        ph_sim[i] = ph0 + (ph_sim[i-1] - ph0)*(1 - theta_drift) + sigma_ph_drift*np.random.normal(0, 1) + np.random.normal(0, sigma_ph_sim)
+        ph_sim[i] = ph0 + (ph_sim[i-1] - ph0)*(1 - theta_drift) + sigma_ph_drift*np.random.normal(0, 1)
+        ph_sim_noise[i] = ph_sim[i] + np.random.normal(0, sigma_ph_sim)
 
         F_vibz[i] = sens_integral(delay, az_m[i], end, weight_vec) * Kz
         F_vibx[i] = sens_integral(delay, ax_m[i], end, weight_vec) * Kx
@@ -83,7 +85,7 @@ def simul_wavefrom(N_sim, alp_amount, T_RP, T, tau, delay, Kz, Kx, Ky, vib_state
 
         alp[i] = alp_start[i % alp_amount]
         alp_vib[i] = alp[i] - F_vibz[i] / (2*np.pi*T*T) - F_vibx[i] / (2*np.pi*T*T) - F_viby[i] / (2*np.pi*T*T)
-        Ph[i] = 2*np.pi*alp_vib[i]*T*T - ph_sim[i]
+        Ph[i] = 2*np.pi*alp_vib[i]*T*T - ph_sim_noise[i]
 
         A_sim[i] = A_sim[i-1] + np.random.normal(0, dA_sim)
         B_sim[i] = B_sim[i-1] + np.random.normal(0, dB_sim)
@@ -97,7 +99,7 @@ def simul_wavefrom(N_sim, alp_amount, T_RP, T, tau, delay, Kz, Kx, Ky, vib_state
     dph_sim = sigma_ph_drift
     dA_sim = np.sqrt(dA_sim**2 + DA_sim**2)
 
-    out = (alp, P_sim_noise, P_sim, ph_sim, A_sim, B_sim, dA_sim, dB_sim,
+    out = (alp, P_sim_noise, P_sim, ph_sim_noise, ph_sim, A_sim, B_sim, dA_sim, dB_sim,
            dph_sim, sigma_A_sim, sigma_ph_sim, az_m, ax_m, ay_m)
 
     return out
@@ -112,20 +114,20 @@ def main():
     delay = 700                # смещение окна интерферометра, отсчёты
     # ---------- набор данных ----------
     alp_amount = 200           # точек alp в одном фринджe
-    n_fringes = 3              # число фринджей
+    n_fringes = 10             # число фринджей
     # ---------- вибрация ----------
     vib_state = 'mooring'      # 'mooring' | 'sailing'
     Kz, Kx, Ky = 0.9, 0.003, 0.003
     sigma_a = 3e-5             # шум акселерометра, м/с^2
     # ---------- фринж и шумы ----------
-    dA_sim = 0 #5e-3              # шаг блуждания A за сброс
-    dB_sim = 0 #5e-3              # шаг блуждания B за сброс
+    dA_sim = 1e-4              # шаг блуждания A за сброс
+    dB_sim = 4e-4              # шаг блуждания B за сброс
     DA_sim = 0.0               # добавка к возвращаемому dA
-    sigma_A_sim = 0 #7e-3         # шум детектирования P
-    sigma_ph_sim = 0 #5e-4        # белый фазовый шум на сброс, рад (0 -- выключить)
+    sigma_A_sim = 5e-3         # шум детектирования P
+    sigma_ph_sim = 1e-4        # белый фазовый шум на сброс, рад (0 -- выключить)
     # ---------- дрейф фазы ----------
-    Dph_drift = 0 #0.01           # стационарная амплитуда дрейфа ph, рад
-    drift_corr = 1000          # время корреляции, сбросов
+    Dph_drift = 1e-3           # стационарная std дрейфа ph (OU), рад
+    drift_corr = 5000          # время корреляции, сбросов
  
     N_sim = alp_amount*n_fringes
     print(f"N_sim = {N_sim}, память на ax/ay/az: {3*N_sim*N_RP*8/1e6:.0f} МБ")
@@ -140,15 +142,18 @@ def main():
                         f"sigma_A={sigma_A_sim:g}, sigma_ph={sigma_ph_sim:g}")
     plt.show()
     return out
-
+ 
+ 
 def plot_waveform(out, *, T, tau, T_RP, delay, Kz, Kx, Ky, sigma_a,
                   g0=9.8125, Dph_drift=None, n_bins=10, title=""):
     """
-    Отображение результата simul_wavefrom (кортеж out в его порядке).
+    Отображение результата simul_wavefrom (кортеж out из 15 элементов, в его порядке).
+    ph_total = ph_sim + белый фазовый шум -- фаза, которая реально идёт в фринж;
+    ph_sim -- чистый OU-дрейф (то, что оценивает EKF).
     Компенсация alp делается по ИЗМЕРЕННОМУ ускорению (a + шум), как с реальными данными.
     Рисует две фигуры: waveform/истина/фринж и разбор невязки по фазе.
     """
-    (alp, P_noise, P_clean, ph_sim, A_s, B_s, dA, dB, dph, sigma_A,
+    (alp, P_noise, P_clean, ph_total, ph_sim, A_s, B_s, dA, dB, dph, sigma_A,
      sigma_ph, az_m, ax_m, ay_m) = out
     N_sim = len(alp)
  
@@ -183,7 +188,8 @@ def plot_waveform(out, *, T, tau, T_RP, delay, Kz, Kx, Ky, sigma_a,
     model = A_s.mean() - B_s.mean()*np.cos(xs)
     shots = np.arange(N_sim)
  
-    # невязка относительно ИСТИННЫХ A, B, ph (при компенсации по измеренному a)
+    # невязка относительно ИСТИННЫХ A, B и ЧИСТОГО дрейфа ph_sim (без белого фазового
+    # шума): невязка содержит и шум детектирования, и белый фазовый шум
     Phi = 2*np.pi*T**2*alp_comp - ph_sim
     res = P_noise - (A_s - B_s*np.cos(Phi))
     phi_m = np.mod(Phi, np.pi)
@@ -196,18 +202,26 @@ def plot_waveform(out, *, T, tau, T_RP, delay, Kz, Kx, Ky, sigma_a,
  
     # ---------- сводка ----------
     rms = lambda v: float(np.sqrt(np.mean(np.square(v))))
+    ph_noise = ph_total - ph_sim
     print("K*F по измеренному a, рад (RMS):  "
           f"x {rms(Fx):.2e}  y {rms(Fy):.2e}  z {rms(Fz):.2e}  сумма {rms(F_meas):.2e}")
     print("Заложено / ожидается:")
     print(f"  dA = {dA:.2e}, dB = {dB:.2e}, dph (шаг OU) = {dph:.2e} рад")
     print(f"  sigma_A = {sigma_A:.2e}")
-    print(f"  sigma_ph (белый, заложен) = {sigma_ph:.2e} рад")
+    print(f"  sigma_ph (белый, заложен) = {sigma_ph:.2e} рад; "
+          f"в данных std(ph_total - ph_sim) = {np.std(ph_noise):.2e} рад")
     print(f"  sigma_ph_vibr (от шума акселерометра) = {sigma_ph_vibr:.2e} рад")
     print(f"  sigma_ph эффективный = sqrt(sum квадратов) = {sigma_ph_eff:.2e} рад")
     # насколько фазовый шум вообще виден в невязке (по сравнению с sigma_A^2)
     share = sigma_ph_eff**2*x_b.max()/sigma_A**2
     print(f"Вклад фазового шума в дисперсию невязки: до {100*share:.2g}% от sigma_A² "
           f"(при max<B²sin²Ph> = {x_b.max():.2e})")
+    # порог определимости sigma_ph по инновациям: вклад ~ B²/2*sigma_ph² сравним
+    # с погрешностью дисперсии sqrt(2/N)*sigma_A²
+    B_mean = float(np.mean(np.abs(B_s)))
+    floor = sigma_A/B_mean*np.sqrt(2)*(2/N_sim)**0.25
+    print(f"Порог определимости sigma_ph по {N_sim} сбросам (1 sigma) ≈ {floor:.2e} рад: "
+          f"{'выше порога' if sigma_ph_eff > floor else 'НИЖЕ порога, автоподбор не определит'}")
     print(f"std невязки = {np.std(res):.3e}, sqrt(sigma_A² + вклад) = "
           f"{np.sqrt(np.mean(v_th)):.3e}")
  
@@ -224,11 +238,12 @@ def plot_waveform(out, *, T, tau, T_RP, delay, Kz, Kx, Ky, sigma_a,
     axs[0, 1].set(xlabel='сброс #', title='Истина: A, B')
     axs[0, 1].legend()
  
-    axs[0, 2].plot(shots, ph_sim - ph0)
+    axs[0, 2].plot(shots, ph_sim - ph0, label='ph_sim (OU)')
     if Dph_drift is not None:
-        axs[0, 2].axhline(Dph_drift, color='gray', ls='--', lw=0.8)
+        axs[0, 2].axhline(Dph_drift, color='gray', ls='--', lw=0.8, label='±Dph_drift (std OU)')
         axs[0, 2].axhline(-Dph_drift, color='gray', ls='--', lw=0.8)
     axs[0, 2].set(xlabel='сброс #', ylabel='ph - ph0, рад', title='Истина: дрейф ph (OU)')
+    axs[0, 2].legend()
  
     axs[1, 0].plot(shots, Fz, lw=0.6, label='Kz·Fz')
     axs[1, 0].plot(shots, Fx, lw=0.6, label='Kx·Fx')
@@ -252,16 +267,23 @@ def plot_waveform(out, *, T, tau, T_RP, delay, Kz, Kx, Ky, sigma_a,
     fig1.suptitle(title)
     fig1.tight_layout()
  
-    # ---------- фигура 2: невязка и её дисперсия по фазе ----------
-    fig2, axs2 = plt.subplots(1, 2, figsize=(12, 4.5))
+    # ---------- фигура 2: невязка, её дисперсия по фазе, белый фазовый шум ----------
+    fig2, axs2 = plt.subplots(1, 3, figsize=(17, 4.5))
     axs2[0].plot(np.mod(Phi + np.pi/2, np.pi) - np.pi/2, res, '.', ms=2, alpha=0.5)
     axs2[0].set(xlabel='Ph (mod π, сдвиг к [-π/2, π/2)), рад', ylabel='P − P_истина',
-                title='Невязка относительно истинных A, B, ph')
+                title='Невязка относительно истинных A, B, ph_sim')
     axs2[1].plot(x_b, v_b, 'o', label='дисперсия невязки в бине')
     axs2[1].plot(x_b, v_th, 'r-', label='sigma_A² + sigma_ph_eff²·<B²sin²Ph>')
     axs2[1].set(xlabel='<B² sin²Ph> в бине', ylabel='дисперсия',
                 title='Проверка: sigma_A и sigma_ph')
     axs2[1].legend()
+    axs2[2].hist(ph_noise, bins=50, density=True, alpha=0.6, label='ph_total − ph_sim')
+    if sigma_ph > 0:
+        xg = np.linspace(-4*sigma_ph, 4*sigma_ph, 200)
+        axs2[2].plot(xg, np.exp(-xg**2/(2*sigma_ph**2))/(sigma_ph*np.sqrt(2*np.pi)),
+                     'r-', label='N(0, sigma_ph)')
+    axs2[2].set(xlabel='рад', ylabel='плотность', title='Белый фазовый шум')
+    axs2[2].legend()
     for a in axs2:
         a.grid(True, alpha=0.3)
     fig2.tight_layout()

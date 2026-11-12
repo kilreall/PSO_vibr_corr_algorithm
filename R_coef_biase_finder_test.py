@@ -1,24 +1,34 @@
 # Проверка автоподбора параметров EKF (sigma_A, sigma_ph, Q) на синтетических
 # данных с ИЗВЕСТНОЙ истиной.
 #
-# Генерация фринджа НЕ дублируется здесь: она импортируется из gen_fringe.py
-# (SimCfg, simulate_fringe). Этот файл добавляет к ней только то, чего в
-# генераторе быть не должно:
-#   * белый шум детектирования P (sigma_A_sim) -- добавляется в generate();
+# Данные генерирует gen_waveform.simul_wavefrom (импортируется, не дублируется):
+# вибрация по x, y, z, дрейф ph (процесс Орнштейна-Уленбека), блуждание A и B,
+# белый фазовый шум и шум детектирования P. Генератор принимает параметры
+# по именам и отдаёт кортеж из 15 элементов:
+#   (alp, P_noise, P_clean, ph_total, ph_sim, A, B, dA, dB, dph,
+#    sigma_A, sigma_ph, az_m, ax_m, ay_m)
+# где ph_sim -- чистый OU-дрейф (то, что оценивает EKF), а
+# ph_total = ph_sim + белый фазовый шум (то, что реально шло в фринж).
+# Для сравнения с оценкой состояния EKF истиной служит ph_sim.
+#
+# Файл добавляет только обвязку:
+#   * SimCfg      -- контейнер параметров генерации (в генератор уходят по именам);
+#   * sim_weights -- веса интеграла чувствительности (в генераторе они считаются
+#                    внутри simul_wavefrom и наружу не отдаются);
 #   * обработку одной осью z (x и y в данных есть через Kx, Ky, но при
 #     обработке их никто не измеряет и не компенсирует).
 #
 # Структура файла:
 #   1. КОНСТАНТЫ            -- имя EKF-модуля, порядок параметров;
-#   2. Классы параметров    -- McCfg (Монте-Карло + шум детектирования) и FitCfg
-#                              (обработка); параметры симуляции -- gen_fringe.SimCfg;
-#   3. Генерация            -- generate(): simulate_fringe + шум детектирования + Fz;
+#   2. Классы параметров    -- SimCfg (генерация), McCfg (Монте-Карло) и FitCfg
+#                              (обработка);
+#   3. Генерация            -- generate(): simul_wavefrom + Fz по измеренному az;
 #   4. Обработка и печать   -- запуск EKF-автоподбора, сравнение с истиной;
 #   5. main()               -- ВСЕ параметры задаются здесь, внизу файла.
 #
 # Что делает тест:
-#   1. Генерирует данные (gen_fringe: вибрация по x, y, z, дрейф ph, блуждание
-#      A и B, белый фазовый шум) и добавляет шум детектирования sigma_A_sim к P.
+#   1. Генерирует данные (simul_wavefrom: вибрация по x, y, z, дрейф ph, блуждание
+#      A и B, белый фазовый шум, шум детектирования sigma_A_sim в P).
 #   2. Компенсирует alp по ускорению ТОЛЬКО по оси z (как на реальных данных).
 #   3. Запускает ту же настройку, что в kalman_pso_fit.py (tune_and_score):
 #      стартовые sigma -> EKF -> оценка R (Фишер / байесовская сетка) -> подбор Q.
@@ -29,27 +39,52 @@
 #   sigma_A   -- белый шум детектирования P (sigma_A_sim);
 #   sigma_ph  -- белый фазовый шум на сброс, рад (sigma_ph_sim);
 #   dA, dB    -- шаги блуждания A и B за сброс (dA_step, dB_step);
-#   dph       -- std шага дрейфа ph (процесс Орнштейна-Уленбека). EKF моделирует
-#                ph как случайное блуждание, так что dph -- эффективный шаг.
+#   dph       -- std шага дрейфа ph (процесс Орнштейна-Уленбека):
+#                dph = Dph_drift*sqrt(theta*(2 - theta)), theta = 1 - exp(-1/drift_corr).
+#                EKF моделирует ph как случайное блуждание, так что dph -- эффективный
+#                шаг; чтобы модель EKF была адекватна, drift_corr должно заметно
+#                превышать n_sim (иначе OU «возвращается к среднему» внутри прогона).
+#
+# РАЗВЁРТКА alp в генераторе: alp пробегает ±1/(5 T²) вокруг keff*g0/(2π), то есть
+# фаза Ph = 2π T² alp - ph меняется на ±2π/5 ≈ ±1.26 рад около экстремума фринджа
+# (охвачено ~40% периода). Дрейф ph должен быть заметно меньше 1.26 рад, иначе
+# развёртка «уйдёт» с экстремума.
 #
 # ВАЖНО: вибрация по x, y (и остаток по z при неточных kz_fit / tau_fit, шум
 # акселерометра) не компенсируется и попадает в фазу как дополнительный шум.
 # Поэтому оценка sigma_ph будет больше заложенного sigma_ph_sim; в отчёте
 # печатается эффективное значение, с которым её и надо сравнивать.
 #
-# Файлы gen_fringe.py (и gen_acc.py, который он импортирует) и EKF_MODULE
-# должны лежать рядом с этим скриптом.
+# СИД ВИБРАЦИИ: в текущем gen_waveform generate_vibration вызывается с seed=42
+# жёстко, поэтому вибрация во всех прогонах Монте-Карло ОДНА И ТА ЖЕ (меняются
+# только шумы A, B, ph, детектирования и акселерометра). Чтобы прогоны были
+# независимы, добавьте в simul_wavefrom параметр vib_seed=42 и передайте его в
+# generate_vibration(seed=vib_seed): этот файл подхватит его автоматически.
+#
+# ПАМЯТЬ: генератор держит записи ускорений по трём осям, это
+# 3 * n_sim * N_RP * 8 байт (при n_sim = 2000 около 0.8 ГБ) на каждый прогон;
+# прогоны идут последовательно, память между ними освобождается.
+#
+# Файлы gen_waveform.py (и gen_acc.py, который он импортирует) и EKF_MODULE
+# должны быть доступны для импорта.
 # Запуск:  python test_ekf_vs_truth.py
 
 import importlib
+import inspect
 import time
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 
-from main.gen_waveform import SimCfg, simulate_fringe, sim_weights, print_summary
+try:
+    from main.gen_waveform import simul_wavefrom, plot_waveform, fa, keff
+    from main.gen_waveform import N_RP as GEN_N_RP
+except ImportError:                      # gen_waveform.py лежит рядом со скриптом
+    from gen_waveform import simul_wavefrom, plot_waveform, fa, keff
+    from gen_waveform import N_RP as GEN_N_RP
 
 # =====================================================================
 # 1. КОНСТАНТЫ
@@ -70,12 +105,46 @@ Q_NAME = {"A": "dA", "B": "dB", "ph": "dph"}
 # =====================================================================
 
 @dataclass
+class SimCfg:
+    """Параметры simul_wavefrom. N_RP в генераторе -- константа модуля."""
+    # --- интерферометр ---
+    T: float                    # длительность плеча, с
+    ty: float                   # длительность импульса, с (tau в генераторе)
+    T_RP: float                 # запись акселерометра на сброс, с
+    delay: int                  # смещение окна интерферометра, отсчёты
+    # --- набор данных ---
+    n_sim: int                  # сбросов в одном прогоне
+    alp_amount: int             # точек развёртки alp в одном фринджe
+    # --- вибрация (генерируются все три оси, обработка видит только z) ---
+    vib_state: str              # 'mooring' | 'sailing'
+    Kz: float                   # коэффициент связи по z
+    Kx: float                   # по x (не компенсируется)
+    Ky: float                   # по y (не компенсируется)
+    sigma_a_acc: float          # шум акселерометра, м/с^2
+    # --- фринж и шумы ---
+    dA_step: float              # шаг блуждания A за сброс
+    dB_step: float              # шаг блуждания B за сброс
+    sigma_A_sim: float          # белый шум детектирования P
+    sigma_ph_sim: float         # белый фазовый шум на сброс, рад
+    # --- дрейф фазы ph ---
+    drift_corr: float           # время корреляции OU, сбросов
+    Dph_drift: float            # стационарная std дрейфа ph (OU), рад
+
+    @property
+    def N_RP(self) -> int:
+        return GEN_N_RP
+
+    @property
+    def t_step(self) -> float:
+        return self.T_RP / GEN_N_RP
+
+
+@dataclass
 class McCfg:
-    """Монте-Карло и то, что добавляется к данным генератора."""
+    """Монте-Карло."""
     n_runs: int                 # число независимых прогонов
     seed: int                   # сид Монте-Карло (сиды прогонов выводятся из него)
-    sigma_A_sim: float          # белый шум детектирования P (в генераторе его нет)
-    verbose_first_run: bool     # печатать сводку генератора для 1-го прогона
+    show_first_run: bool        # сводка и графики генератора (plot_waveform) для 1-го прогона
 
 
 @dataclass
@@ -103,38 +172,81 @@ class FitCfg:
 # 3. ГЕНЕРАЦИЯ ОДНОГО ПРОГОНА
 # =====================================================================
 
-def generate(sim: SimCfg, mc: McCfg, weight_ekf, win_len, kz_fit, tau_fit,
-             seed_gen, seed_det, show_summary=False):
+def sim_weights(T, ty, t_step):
+    """
+    Веса интеграла чувствительности: keff * (a[окно] @ w) -- интеграл fa(t)*a(t)
+    по окну интерферометра. Построены ровно так же, как внутри simul_wavefrom
+    (там они наружу не отдаются), поэтому при правке генератора правьте и здесь.
+    """
+    t_range = np.linspace(0, 2 * T + 4 * ty, round((2 * T + 4 * ty) / t_step))
+    fa_t = np.vectorize(fa, otypes=[float])(t_range, T, ty)
+    w = np.full(len(t_range), t_step)
+    w[0] *= 0.5
+    w[-1] *= 0.5
+    return fa_t * w
+
+
+def generate(sim: SimCfg, mc: McCfg, weight_ekf, win_len, w_gen, kz_fit, tau_fit,
+             seed_gen, show_summary=False):
     """
     Данные одного прогона + истинные значения.
 
-    simulate_fringe даёт P с белым фазовым шумом; шум детектирования sigma_A
-    добавляется здесь. Обработка видит только ось z: Fz -- интеграл
-    чувствительности по измеренному az на окне tau_fit (без Kz; Kz применяется
-    в compensate_alp). Оси x, y входят только в истинную фазу.
+    simul_wavefrom отдаёт P уже с шумом детектирования и измеренные (с шумом
+    акселерометра) ускорения по трём осям. Обработка видит только ось z:
+    Fz -- интеграл чувствительности по измеренному az на окне tau_fit (без Kz;
+    Kz применяется в compensate_alp). Оси x, y входят только в истинную фазу.
+
+    Истинное состояние для сравнения с EKF: A, B и ph_sim (чистый OU-дрейф без
+    белого фазового шума; белый шум EKF учитывает через sigma_ph в R).
     """
-    # записи ускорений нужны только если окно обработки не совпадает с окном генерации
-    need_acc = tau_fit != sim.delay
-    cfg = replace(sim, seed=seed_gen, keep_acc=need_acc)
-    d = simulate_fringe(cfg, verbose=False)
+    # генератор берёт шум (A, B, ph, детектирование, акселерометр) из глобального
+    # np.random
+    np.random.seed(seed_gen)
+    kwargs = dict(
+        N_sim=sim.n_sim, alp_amount=sim.alp_amount, T_RP=sim.T_RP, T=sim.T,
+        tau=sim.ty, delay=sim.delay, Kz=sim.Kz, Kx=sim.Kx, Ky=sim.Ky,
+        vib_state=sim.vib_state, sigma_a=sim.sigma_a_acc,
+        Dph_drift=sim.Dph_drift, drift_corr=sim.drift_corr,
+        sigma_A_sim=sim.sigma_A_sim, sigma_ph_sim=sim.sigma_ph_sim,
+        dA_sim=sim.dA_step, dB_sim=sim.dB_step,
+        DA_sim=0.0)             # DA_sim лишь добавляется к возвращаемому dA
+    # сид вибрации: если в simul_wavefrom есть параметр vib_seed -- меняем его
+    # от прогона к прогону, иначе вибрация во всех прогонах одна и та же
+    if "vib_seed" in inspect.signature(simul_wavefrom).parameters:
+        kwargs["vib_seed"] = seed_gen
+    out = simul_wavefrom(**kwargs)
+    (alp, P_noise, _P_clean, ph_total, ph_sim, A, B, dA, dB, dph, sigma_A,
+     sigma_ph, az_m, ax_m, ay_m) = out
+
     if show_summary:
-        print_summary(d, cfg)
+        plot_waveform(out, T=sim.T, tau=sim.ty, T_RP=sim.T_RP, delay=sim.delay,
+                      Kz=sim.Kz, Kx=sim.Kx, Ky=sim.Ky, sigma_a=sim.sigma_a_acc,
+                      Dph_drift=sim.Dph_drift, title="прогон 1")
 
-    if need_acc:
-        Fz = ekf.vibration_phase(d["az_m"], tau_fit, weight_ekf, win_len)
-    else:
-        Fz = d["Fz_raw"]
+    Fz = ekf.vibration_phase(az_m, tau_fit, weight_ekf, win_len)
 
-    y = d["P_noise"] + np.random.default_rng(seed_det).normal(
-        0, mc.sigma_A_sim, cfg.n_sim)
+    # веса EKF и генератора должны давать один и тот же интеграл
+    Fz_ref = keff * (az_m[:, tau_fit:tau_fit + win_len] @ w_gen)
+    if not np.allclose(Fz, Fz_ref, rtol=1e-6, atol=1e-9 * np.max(np.abs(Fz_ref))):
+        raise ValueError("ekf.vibration_phase не совпадает с интегралом по весам "
+                         "генератора: проверьте веса, keff и окно")
 
-    # фаза, не убранная компенсацией: x, y, шум акселерометра, ошибки kz/tau
-    resid_rms = rms(d["F_vib"] - kz_fit * Fz)
+    # фаза, не убранная компенсацией: x, y, ошибки kz/tau (по измеренным a, как в
+    # plot_waveform) + шум акселерометра, попадающий в компенсацию через az.
+    # При tau_fit != delay и sigma_a_acc > 0 оценка слегка завышена шумом.
+    sl = slice(sim.delay, sim.delay + win_len)
+    Fx = keff * (ax_m[:, sl] @ w_gen)
+    Fy = keff * (ay_m[:, sl] @ w_gen)
+    Fz_d = keff * (az_m[:, sl] @ w_gen)
+    r_det = rms(sim.Kx * Fx + sim.Ky * Fy + sim.Kz * Fz_d - kz_fit * Fz)
+    r_noise = kz_fit * keff * sim.sigma_a_acc * float(np.linalg.norm(w_gen))
+    resid_rms = float(np.hypot(r_det, r_noise))
 
-    truth = {"sigma_A": float(mc.sigma_A_sim), "sigma_ph": d["sigma_ph"],
-             "dA": d["dA"], "dB": d["dB"], "dph": d["dph"]}
-    return {"alp": d["alp"], "y": y, "Fz": Fz, "A": d["A"], "B": d["B"],
-            "ph": d["ph"], "truth": truth, "resid_rms": resid_rms}
+    truth = {"sigma_A": float(sigma_A), "sigma_ph": float(sigma_ph),
+             "dA": float(dA), "dB": float(dB), "dph": float(dph)}
+    return {"alp": alp, "y": P_noise, "Fz": Fz, "A": A, "B": B,
+            "ph": ph_sim, "ph_total": ph_total, "truth": truth,
+            "resid_rms": resid_rms}
 
 
 # =====================================================================
@@ -164,8 +276,9 @@ def q_start_text(fit: FitCfg):
 
 def state_rms(x_est, data, fit: FitCfg):
     """
-    RMS ошибки оценок состояния [A, B, ph] относительно истины.
-    x_est[i] -- оценка после сброса poi + i; берутся точки после warmup.
+    RMS ошибки оценок состояния [A, B, ph] относительно истины (ph -- ph_sim,
+    чистый OU-дрейф). x_est[i] -- оценка после сброса poi + i; берутся точки
+    после warmup.
     """
     w = fit.warmup
     A_e, B_e, ph_e = x_est[w:, 0], x_est[w:, 1], x_est[w:, 2]
@@ -311,12 +424,21 @@ def run_test(sim: SimCfg, mc: McCfg, fit: FitCfg):
     tau_fit = sim.delay if fit.tau_fit is None else fit.tau_fit
 
     weight_ekf, win_len = ekf.build_weight_vec(sim.T, sim.ty, sim.t_step)
-    n_gen = len(sim_weights(sim.T, sim.ty, sim.t_step))
-    if win_len != n_gen:
-        raise ValueError(f"длина окна различается: EKF {win_len} и генератор {n_gen}")
+    w_gen = sim_weights(sim.T, sim.ty, sim.t_step)
+    if win_len != len(w_gen):
+        raise ValueError(f"длина окна различается: EKF {win_len} и генератор {len(w_gen)}")
     for name, tau in (("delay", sim.delay), ("tau_fit", tau_fit)):
         if tau < 0 or tau + win_len > sim.N_RP:
             raise ValueError(f"{name} + win_len = {tau + win_len} > N_RP = {sim.N_RP}")
+
+    # консистентность дрейфа с моделью EKF (случайное блуждание)
+    if sim.drift_corr < 5 * sim.n_sim:
+        print(f"ВНИМАНИЕ: drift_corr = {sim.drift_corr:g} < 5*n_sim = {5 * sim.n_sim}: "
+              f"OU заметно возвращается к среднему внутри прогона, EKF (случайное "
+              f"блуждание ph) модель дрейфа описывает хуже.")
+    if "vib_seed" not in inspect.signature(simul_wavefrom).parameters:
+        print("ВНИМАНИЕ: в simul_wavefrom нет vib_seed -- вибрация во всех прогонах "
+              "одна и та же (seed=42 внутри генератора).")
 
     ekf._jit_warmup()
 
@@ -335,10 +457,8 @@ def run_test(sim: SimCfg, mc: McCfg, fit: FitCfg):
     for r in range(mc.n_runs):
         t_run = time.perf_counter()
         seed_gen = int(rng.integers(0, 2 ** 31 - 1))
-        seed_det = int(rng.integers(0, 2 ** 31 - 1))
-        data = generate(sim, mc, weight_ekf, win_len, kz_fit, tau_fit,
-                        seed_gen, seed_det,
-                        show_summary=(mc.verbose_first_run and r == 0))
+        data = generate(sim, mc, weight_ekf, win_len, w_gen, kz_fit, tau_fit,
+                        seed_gen, show_summary=(mc.show_first_run and r == 0))
         truth = data["truth"]
         resid.append(data["resid_rms"])
 
@@ -359,6 +479,8 @@ def run_test(sim: SimCfg, mc: McCfg, fit: FitCfg):
 
     print_report(sim, mc, fit, truth, results, tcfgs, orc, resid,
                  time.perf_counter() - t_all)
+    if mc.show_first_run:
+        plt.show()              # графики 1-го прогона показываются после отчёта
 
 
 # =====================================================================
@@ -366,45 +488,52 @@ def run_test(sim: SimCfg, mc: McCfg, fit: FitCfg):
 # =====================================================================
 
 def main():
+    # Значения подобраны так, чтобы все пять параметров (sigma_A, sigma_ph, dA, dB,
+    # dph) были различимы на n_sim = 2000 сбросах:
+    #   * sigma_ph заметно выше порога определимости (см. «Порог определимости» в
+    #     сводке plot_waveform, ~2.4e-3 рад для этих sigma_A и B) -- вклад
+    #     B²sin²Ph·sigma_ph² в дисперсию P сравним с sigma_A², и их можно разделить
+    #     по зависимости дисперсии невязки от sin²Ph (развёртка охватывает ±1.26 рад);
+    #   * шаги dA, dB, dph достаточно велики, чтобы блуждание было видно на фоне шума
+    #     за 2000 сбросов, но A, B и ph не уходят далеко (A, B -- на ~0.04, ph -- на
+    #     ~0.35 рад, развёртка ±1.26 рад остаётся вокруг экстремума);
+    #   * drift_corr = 10*n_sim, поэтому OU ≈ случайное блуждание, как в модели EKF.
+    # Ожидаемая относительная точность одной оценки (асимптотика максимального
+    # правдоподобия, реплика фильтра, 12 реализаций): sigma_A ~5%, sigma_ph ~5%,
+    # dA ~25%, dB ~25%, dph ~13%. dA и dB различимы хуже всего: A, B и ph
+    # коррелированы на неполном периоде фринджа.
+
     # ==================================================================
-    # (А) ПАРАМЕТРЫ СИМУЛЯЦИИ (gen_fringe.SimCfg) И МОНТЕ-КАРЛО
+    # (А) ПАРАМЕТРЫ ГЕНЕРАЦИИ (gen_waveform.simul_wavefrom) И МОНТЕ-КАРЛО
     # ==================================================================
     sim = SimCfg(
         # --- интерферометр ---
         T=10e-3,                    # длительность плеча, с
         ty=20e-6,                   # длительность импульса, с
         T_RP=33.556e-3,             # запись акселерометра на сброс, с
-        N_RP=16384,                 # отсчётов акселерометра на сброс
+        delay=700,                  # смещение окна интерферометра, отсчёты
         # --- набор данных ---
-        n_sim=2000,                 # сбросов в одном прогоне
+        n_sim=2000,                 # сбросов в одном прогоне (10 фринджей)
         alp_amount=200,             # точек развёртки alp в одном фринджe
-        seed=0,                     # не используется: сиды прогонов задаёт McCfg.seed
         # --- вибрация (генерируются все три оси, обработка видит только z) ---
         vib_state="mooring",        # 'mooring' | 'sailing'
-        hp_cutoff=0.01,             # срез ВЧ-фильтра акселерометра, Гц
         Kz=0.9,                     # коэффициент связи по z
         Kx=0.003,                   # коэффициент связи по x (не компенсируется)
         Ky=0.003,                   # коэффициент связи по y (не компенсируется)
-        delay=700,                  # смещение окна интерферометра, отсчёты
-        sigma_a_acc=0.0,            # шум акселерометра, м/с^2 (в gen_fringe по умолчанию 3e-5)
-        # --- фринж ---
-        A0=0.15,                    # начальное A
-        B0=0.21,                    # начальное B
-        dA_step=5e-3,               # шаг блуждания A за сброс
-        dB_step=5e-3,               # шаг блуждания B за сброс
-        # --- шум ---
-        sigma_ph_sim=5.6e-3,        # белый фазовый шум на сброс, рад
+        sigma_a_acc=3e-5,           # шум акселерометра, м/с^2 (даёт ~5e-4 рад в компенсации)
+        # --- фринж и шумы ---
+        dA_step=8e-4,               # шаг блуждания A за сброс
+        dB_step=8e-4,               # шаг блуждания B за сброс
+        sigma_A_sim=2e-3,           # белый шум детектирования P
+        sigma_ph_sim=2e-2,          # белый фазовый шум на сброс, рад
         # --- дрейф фазы ph ---
-        drift_corr=1000,            # время корреляции, сбросов
-        Dph_drift=0.01,             # амплитуда дрейфа ph, рад
-        # --- вывод ---
-        keep_acc=False)             # переопределяется в generate() по необходимости
+        drift_corr=20000,           # время корреляции OU, сбросов (>> n_sim)
+        Dph_drift=0.8)              # стационарная std дрейфа ph, рад; шаг dph ≈ 8e-3 рад
 
     mc = McCfg(
         n_runs=10,                  # число независимых прогонов
         seed=123,                   # сид Монте-Карло
-        sigma_A_sim=7e-3,           # белый шум детектирования P (добавляется в тесте)
-        verbose_first_run=False)    # сводка генератора для 1-го прогона
+        show_first_run=False)       # сводка и графики генератора для 1-го прогона
 
     # ==================================================================
     # (Б) ПАРАМЕТРЫ ОБРАБОТКИ: компенсация, начальные Q и R, настройка EKF
@@ -414,10 +543,11 @@ def main():
         kz_fit=None,                # None -> Kz генерации; иначе проверка при неточном Kz
         tau_fit=None,               # None -> delay генерации; иначе проверка при неточном tau
         # --- начальный фит и фильтр ---
-        poi=200,                    # точек для начального линейного фита
+        poi=200,                    # точек для начального линейного фита (один фринж)
         warmup=200,                 # инноваций после poi, не входящих в fitness
         # --- начальные Q ---
-        q_init_std=(1e-3, 1e-3, 1e-3),      # std шага (dA, dB, dph)
+        # близко к истине (в пределах ~2 раз), но не равно ей: dA, dB = 8e-4, dph ≈ 8e-3
+        q_init_std=(5e-4, 5e-4, 4e-3),      # std шага (dA, dB, dph)
         # --- начальные R (только для первого прогона EKF) ---
         sigma_init_mode="bins",     # "bins" | "split" | "manual"
         sigma_init=None,            # (sigma_A, sigma_ph) при "manual"
