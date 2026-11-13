@@ -1,0 +1,10 @@
+T_us 12000.000
+tau_us 13.400
+omega1_thz 384.233426
+omega2_thz 384.226592
+raman+_hz 6835032000
+raman-_hz 6834308000
+alpha+_hz 25160000.000
+alpha-_hz -25162500.000
+num 5
+delay 0
