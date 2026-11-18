@@ -5,21 +5,7 @@ from numba import njit
 @njit(cache=True)
 def _ekf_core(alp, y, x0, P0, qd, sA2, sph2, two_pi_T2, start,
               e_out, h_out, b_out, x_out, p_out):
-    """
-    Прямой прогон EKF с сохранением траектории.
-
-    Вход:
-      alp, y     -- компенсированный чирп и сигнал (после начального фита);
-      x0, P0     -- начальные состояние и ковариация;
-      qd         -- диагональ Q (3,);  sA2, sph2 -- sigma_A^2, sigma_ph^2;
-      two_pi_T2  -- 2*pi*T^2;
-      start      -- с какого индекса точки входят в сумму NLL (warmup).
-    Выход (заполняются на месте):
-      e_out -- инновации; h_out -- H P^- H^T; b_out -- B^2 sin^2(Phi);
-      x_out -- апостериорные оценки состояния.
-    Возвращает (sum_{i>=start} [ln S_i + e_i^2/S_i], число таких точек);
-    (inf, 0) при сбое (S <= 0 или нечисловая невязка).
-    """
+    
     n = alp.shape[0]
     x = x0.copy()
     P = P0.copy()
