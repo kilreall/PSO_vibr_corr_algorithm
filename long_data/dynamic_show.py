@@ -35,9 +35,9 @@ Kz для компенсации (KZ_MODE):
 T_CYCLE_NOMINAL (если задан) -- номинальный период цикла для пересчёта
 чувствительности в мкГал/sqrt(Гц).
 
-Результат: графики Kz(t) (обе ветки, оба критерия), g(t) (EKF и фринж на одном
-графике), девиация Аллана g по числу циклов, график чувствительности и эффекта
-Kz(t), CSV с таблицами Kz по блокам и с рядами g.
+Результат: сводки в консоль и графики Kz(t) (обе ветки, оба критерия), g(t)
+(EKF и фринж на одном графике), девиация Аллана g по числу циклов, график
+чувствительности и эффекта Kz(t). Файлы (CSV, PNG) не сохраняются.
 
 Компенсация чирпа:  alp_comp = alp - Kz * F_z / (2*pi*T^2).  Kz ~ 9.8.
 
@@ -1111,7 +1111,7 @@ def _process_block(job):
 
 
 # =====================================================================
-# 13. Печать, CSV, график Kz
+# 13. Печать и график Kz
 # =====================================================================
 
 def _print_block(r, n_blocks, i0, i1, t_c, tag=""):
@@ -1131,18 +1131,6 @@ def _print_block(r, n_blocks, i0, i1, t_c, tag=""):
           flush=True)
 
 
-CSV_COLUMNS = ["block", "i_start", "i_stop", "t_s", "Kz_kalman", "J", "sigma_A",
-               "sigma_ph", "dg_sigma_ph_ugal", "nu_std", "lb_p", "Kz_win", "rms",
-               "q_A", "q_B", "q_ph"]
-
-
-def save_csv(res, path):
-    """Таблица результатов по блокам (колонки CSV_COLUMNS)."""
-    arr = np.column_stack([np.asarray(res[c], dtype=float) for c in CSV_COLUMNS])
-    np.savetxt(path, arr, delimiter=",", header=",".join(CSV_COLUMNS),
-               comments="", fmt="%.10g")
-
-
 def _time_unit(tmax):
     """Делитель и подпись единицы времени для оси x графиков."""
     if tmax >= 2 * 3600:
@@ -1155,14 +1143,12 @@ def _time_unit(tmax):
 BRANCH_COLORS = {"+": "tab:blue", "-": "tab:red"}
 
 
-def plot_kz_dynamics(branches, kz_ref=None, out_png=None, show=True):
+def plot_kz_dynamics(branches, kz_ref=None):
     """
     График Kz(t) для обеих веток чирпа: EKF и оконный cos-fit.
     branches: {"+": res_plus, "-": res_minus} -- результаты run_kz_dynamics.
+    Окно отображается общим plt.show() в main.
     """
-    import matplotlib
-    if not show:
-        matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     tmax = max(float(np.nanmax(np.asarray(r["t_s"], dtype=float)))
@@ -1186,10 +1172,6 @@ def plot_kz_dynamics(branches, kz_ref=None, out_png=None, show=True):
     ax.grid(alpha=0.3)
     ax.legend()
     fig.tight_layout()
-    if out_png:
-        fig.savefig(out_png, dpi=150)
-    if not show:
-        plt.close(fig)          # при show=True окно открывается общим plt.show() в main
 
 
 def print_summary(res, label=""):
@@ -1309,10 +1291,12 @@ def run_kz_dynamics(alp, P_exp, Fz, *,
     print(f"Данных: {N} сбросов; блоков: {n_blocks} x {block_size} "
           f"(используется {n_use}, отброшено {N - n_use}); "
           f"блок ~ {block_size * t_cycle / 60:.1f} мин")
+    qb = tcfg.q_log_bounds
     print(f"T={T * 1e3:g} мс, Kz_bounds={tuple(Kz_bounds)}, "
           f"PSO: {n_particles} частиц x {n_iter} итераций, "
           f"tune_mode={tcfg.tune_mode}, r_method={tcfg.r_method}, "
-          f"q_optimizer={tcfg.q_optimizer}\n")
+          f"q_optimizer={tcfg.q_optimizer}, "
+          f"log10 q: {tuple(qb) if qb is not None else f'q_init ± {tcfg.q_decades:g} дек.'}\n")
 
     prm = EkfParams(T=T,
                     q_init=np.array([dA_model ** 2, dB_model ** 2, dph_model ** 2]),
@@ -1623,14 +1607,11 @@ def kz_sensitivity_ekf(alp, y, Fz, best, prm, g_sign, dKz=0.02):
     return g_sign * (p1 - p0) / dKz * g_per_rad(prm.T) * UGAL
 
 
-def plot_kz_effect(t_f, sens, effect, out_png=None, show=True):
+def plot_kz_effect(t_f, sens, effect):
     """
     Две панели: (1) dg/dKz по группам фринджа для веток и среднего (мкГал на ед. Kz);
     (2) эффект Kz(t) на g: g(Kz по блокам) - g(глобальный Kz), среднее по веткам.
     """
-    import matplotlib
-    if not show:
-        matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     div, unit = _time_unit(float(t_f[-1]))
@@ -1650,10 +1631,6 @@ def plot_kz_effect(t_f, sens, effect, out_png=None, show=True):
     ax.set_title("Эффект Kz(t): g(Kz по блокам) − g(глобальный Kz), среднее по веткам")
     ax.grid(alpha=0.3)
     fig.tight_layout()
-    if out_png:
-        fig.savefig(out_png, dpi=150)
-    if not show:
-        plt.close(fig)
 
 
 # =====================================================================
@@ -1706,15 +1683,12 @@ def white_noise_sensitivity(ms, adev, m_lo, m_hi):
     return float(np.exp(np.mean(np.log(adev[sel] * np.sqrt(ms[sel])))))
 
 
-def plot_allan_compare(curves, t_cycle, fit_m, out_png=None, show=True, title=""):
+def plot_allan_compare(curves, t_cycle, fit_m, title=""):
     """
     Девиация Аллана g (log-log, ось x -- число циклов) для нескольких рядов на одном графике.
     curves: список dict(label, m, adev, err, sens, color, [fmt], [alpha]).
     В подписи -- чувствительность каждого ряда.
     """
-    import matplotlib
-    if not show:
-        matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(9, 6))
@@ -1741,22 +1715,15 @@ def plot_allan_compare(curves, t_cycle, fit_m, out_png=None, show=True, title=""
             transform=ax.transAxes, ha="right", va="top", fontsize=8,
             bbox=dict(boxstyle="round", fc="white", ec="gray", alpha=0.9))
     fig.tight_layout()
-    if out_png:
-        fig.savefig(out_png, dpi=150)
-    if not show:
-        plt.close(fig)          # при show=True окно открывается общим plt.show() в main
 
 
-def plot_g_compare(t_k, g_k, t_f, g_f, npts, out_png=None, show=True, title=""):
+def plot_g_compare(t_k, g_k, t_f, g_f, npts, title=""):
     """
     g(t) для EKF и фринджа по npts точкам на одном графике.
     Три панели: среднее по ветвям, ветка "+", ветка "-".
     g_k, g_f: dict с ключами "mean", "+", "-" (мкГал, без среднего);
     t_k, t_f -- время, с, для EKF (каждый цикл) и фринджа (центр группы).
     """
-    import matplotlib
-    if not show:
-        matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     div, unit = _time_unit(float(max(t_k[-1], t_f[-1])))
@@ -1776,16 +1743,6 @@ def plot_g_compare(t_k, g_k, t_f, g_f, npts, out_png=None, show=True, title=""):
     axes[-1].set_xlabel(f"Время, {unit}")
     fig.suptitle(title or "Ряд g: EKF и фринж по точкам")
     fig.tight_layout()
-    if out_png:
-        fig.savefig(out_png, dpi=150)
-    if not show:
-        plt.close(fig)          # при show=True окно открывается общим plt.show() в main
-
-
-def save_g_series_csv(path, header, columns):
-    """Сохраняет столбцы (список массивов одной длины) в CSV с заголовком header."""
-    arr = np.column_stack([np.asarray(c, dtype=float) for c in columns])
-    np.savetxt(path, arr, delimiter=",", header=header, comments="", fmt="%.10g")
 
 
 # =====================================================================
@@ -1798,7 +1755,7 @@ def main():
     CORR_PER_G = 2048.0        # бинов corr на 1 g (F_z = знак * corr / CORR_PER_G)
     TABLE_ROWS = (0, 127000)   # строки таблицы; дальше ~128000 сигнал меняет режим (непригоден)
     T_CYCLE_NOMINAL = 0.175    # номинальный период цикла (+ и -), с; None -- взять по файлу
-    SHOW_PLOT = True
+    SHOW_PLOT = True           # рисовать графики (файлы не сохраняются)
 
     # Знак F_z для каждой ветки: подобран эмпирически -- на сырых corr оптимум Kz
     # отрицателен для "+" и положителен для "-" (обращение k_eff меняет знак
@@ -1851,15 +1808,6 @@ def main():
     DO_KZ_SENS = True
     DKZ_STEP = 0.02              # шаг численной производной по Kz
 
-    OUT_KZ_PNG = "kz_dynamics_pm.png"
-    OUT_G_PNG = "g_compare_pm.png"
-    OUT_ALLAN_PNG = "allan_g_pm.png"
-    OUT_KZEFF_PNG = "kz_effect_pm.png"
-    OUT_G_KALMAN_CSV = "g_kalman_pm.csv"
-    OUT_G_FRINGE_CSV = "g_fringe_pm.csv"
-    OUT_KZSENS_CSV = "kz_sensitivity_pm.csv"
-    NAME = {"+": "plus", "-": "minus"}
-
     if KZ_MODE not in ("global", "blocks"):
         raise ValueError(f"KZ_MODE: 'global' | 'blocks', получено {KZ_MODE!r}")
     if FRINGE_KZ not in ("kalman", "window"):
@@ -1867,13 +1815,17 @@ def main():
 
     # "alternate": чередование R -> Q с линейным поиском по настоящему J (см. _tune_alternate);
     # "joint" -- подбор sigma и q вместе, даёт те же J, но медленнее.
+    # Границы q: log10 q в [-13, -4] (прежние +-3 декады вокруг q_init = 1e-6 упирались
+    # в нижнюю границу 1e-9: q_B во всех блоках, q_A и q_ph -- в части блоков).
+    # lbfgs_maxfun увеличен: область шире, шагов нужно больше.
     tune_cfg = TuneCfg(sigma_init_mode="bins",
                        tune_mode="alternate",
                        r_method="fisher",
                        q_optimizer="lbfgs",
                        n_outer=6,
                        q_free=(True, True, True),
-                       # q_log_bounds=(-12, -2),
+                       q_log_bounds=(-13.0, -4.0),
+                       lbfgs_maxfun=200,
                        )
 
     # ---------------- загрузка: обе ветки из одной таблицы ----------------
@@ -1898,14 +1850,10 @@ def main():
             n_particles=N_PARTICLES, n_iter=N_ITER, pso_xtol=PSO_XTOL,
             n_jobs=N_JOBS, seed=SEED, tag=f"[{sg}] ")
         print_summary(res, f"(чирп {sg}) ")
-        csv_path = f"kz_dynamics_{NAME[sg]}.csv"
-        save_csv(res, csv_path)
-        print(f"Таблица сохранена: {csv_path}")
         branches[sg] = {"alp": alp, "y": y, "res": res}
 
-    plot_kz_dynamics({sg: b["res"] for sg, b in branches.items()},
-                     kz_ref=KZ_REF, out_png=OUT_KZ_PNG, show=SHOW_PLOT)
-    print(f"График сохранён: {OUT_KZ_PNG}")
+    if SHOW_PLOT:
+        plot_kz_dynamics({sg: b["res"] for sg, b in branches.items()}, kz_ref=KZ_REF)
 
     # ---------------- g: EKF и фринж, среднее по веткам, Аллан ----------------
     if DO_ALLAN:
@@ -1980,18 +1928,10 @@ def main():
               f"std фринж = {g_f['mean'].std():.3g} мкГал ({npts}-точечные группы); "
               f"std(EKF усредн. по группам - фринж) = {np.std(k_avg - g_f['mean']):.3g} мкГал")
 
-        # --- CSV ---
-        save_g_series_csv(OUT_G_KALMAN_CSV, "cycle,t_s,g_plus_ugal,g_minus_ugal,g_mean_ugal",
-                          [i_first + np.arange(len(g_k["mean"])), t_k,
-                           g_k["+"], g_k["-"], g_k["mean"]])
-        save_g_series_csv(OUT_G_FRINGE_CSV, "cycle_center,t_s,g_plus_ugal,g_minus_ugal,g_mean_ugal",
-                          [fr["+"]["i_center"], t_f, g_f["+"], g_f["-"], g_f["mean"]])
-        print(f"Ряды g сохранены: {OUT_G_KALMAN_CSV}, {OUT_G_FRINGE_CSV}")
-
         # --- график g: EKF и фринж на одном графике ---
-        plot_g_compare(t_k, g_k, t_f, g_f, npts, OUT_G_PNG, SHOW_PLOT,
-                       f"Ряд g (среднее по ветвям ±): EKF и фринж по точкам, Kz: {KZ_MODE}")
-        print(f"График сохранён: {OUT_G_PNG}")
+        if SHOW_PLOT:
+            plot_g_compare(t_k, g_k, t_f, g_f, npts,
+                           f"Ряд g (среднее по ветвям ±): EKF и фринж по точкам, Kz: {KZ_MODE}")
 
         # --- девиация Аллана: EKF и фринж на одном графике ---
         series = [("mean", "среднее", "tab:blue", "tab:orange")]
@@ -2011,9 +1951,9 @@ def main():
                 print(f"Аллан [{name}, {lab}]: S = {sens:.3g} мкГал/√цикл "
                       f"(≈ {sens * np.sqrt(t_cycle):.3g} мкГал/√Гц); "
                       f"ADEV({m[0]} ц.) = {adev[0]:.3g}, ADEV({m[-1]} ц.) = {adev[-1]:.3g} мкГал")
-        plot_allan_compare(curves, t_cycle, ALLAN_FIT_M, OUT_ALLAN_PNG, SHOW_PLOT,
-                           "Девиация Аллана g: EKF и фринж по точкам")
-        print(f"График сохранён: {OUT_ALLAN_PNG}")
+        if SHOW_PLOT:
+            plot_allan_compare(curves, t_cycle, ALLAN_FIT_M,
+                               "Девиация Аллана g: EKF и фринж по точкам")
 
         # ---------------- чувствительность g к Kz ----------------
         if DO_KZ_SENS:
@@ -2049,8 +1989,8 @@ def main():
             print(f"Сдвиг среднего g из-за разброса Kz по блокам: "
                   f"независимые ошибки ~ {shift_ind:.3g} мкГал, "
                   f"общая ошибка (худший случай) ~ {shift_corr:.3g} мкГал")
-            print(f"Разница Kz(+)-Kz(-) по лучшим прогонам: "
-                  f"{best_run['+']['Kz'].mean() - best_run['-']['Kz'].mean() if KZ_MODE == 'blocks' else best_run['+']['Kz'] - best_run['-']['Kz']:+.4f}")
+            dkz = float(np.mean(best_run["+"]["Kz"]) - np.mean(best_run["-"]["Kz"]))
+            print(f"Разница Kz(+)-Kz(-) по прогонам: {dkz:+.4f}")
 
             # --- эффект Kz(t): фринж с Kz по блокам минус фринж с глобальным Kz ---
             g_glob_mean = 0.5 * (fr_glob["+"]["g_ugal"] + fr_glob["-"]["g_ugal"])
@@ -2060,15 +2000,9 @@ def main():
                   f"std={effect.std():.3g} мкГал, размах={np.ptp(effect):.3g} мкГал; "
                   f"для сравнения std g (глобальный Kz)={g_glob_mean.std():.3g} мкГал")
 
-            save_g_series_csv(OUT_KZSENS_CSV,
-                              "cycle_center,t_s,dgdKz_plus,dgdKz_minus,dgdKz_mean,"
-                              "g_effect_Kz_t_ugal",
-                              [fr["+"]["i_center"], t_f, sens_f["+"], sens_f["-"], s_mean,
-                               effect])
-            print(f"Чувствительность сохранена: {OUT_KZSENS_CSV}")
-            plot_kz_effect(t_f, {"+": sens_f["+"], "-": sens_f["-"], "mean": s_mean},
-                           effect, OUT_KZEFF_PNG, SHOW_PLOT)
-            print(f"График сохранён: {OUT_KZEFF_PNG}")
+            if SHOW_PLOT:
+                plot_kz_effect(t_f, {"+": sens_f["+"], "-": sens_f["-"], "mean": s_mean},
+                               effect)
 
     if SHOW_PLOT:
         import matplotlib.pyplot as plt
