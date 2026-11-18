@@ -70,7 +70,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 from numba import njit
-from scipy.optimize import minimize, nnls
+from scipy.optimize import minimize, minimize_scalar, nnls
 from scipy.stats import chi2 as chi2_dist
 
 
@@ -1649,7 +1649,205 @@ def white_noise_sensitivity(ms, adev, m_lo, m_hi):
     return float(np.exp(np.mean(np.log(adev[sel] * np.sqrt(ms[sel])))))
 
 
+# =====================================================================
+# 18. Kz как состояние фильтра Калмана: x = [A, B, ph, Kz]
+# =====================================================================
+#
+# Phi = 2*pi*T^2*alp - Kz*Fz - ph  (alp -- СЫРОЙ чирп, компенсация внутри модели)
+# H = [1, -cos Phi, -B sin Phi, -B sin Phi * Fz],  F = I,  Q = diag(qA, qB, qph, qKz)
 
+@njit(cache=True)
+def _ekf4_core(c, Fz, y, x0, P0, qd, sA2, sph2, start,
+               e_out, h_out, b_out, x_out, p_out):
+    """
+    Прямой прогон EKF с 4 состояниями. c = 2*pi*T^2*alp.
+    Выход: e_out, h_out, b_out как в _ekf_core; x_out (n,4) -- состояние;
+    p_out (n,2) -- P[2,2] (ph) и P[3,3] (Kz).
+    Возвращает (sum_{i>=start}[ln S + e^2/S], число точек); (inf, 0) при сбое.
+    """
+    n = c.shape[0]
+    x = x0.copy()
+    P = P0.copy()
+    H = np.empty(4)
+    PHt = np.empty(4)
+    K = np.empty(4)
+    nll = 0.0
+    cnt = 0
+
+    for i in range(n):
+        for j in range(4):
+            P[j, j] += qd[j]
+
+        Phi = c[i] - x[3] * Fz[i] - x[2]
+        cs = np.cos(Phi)
+        sn = np.sin(Phi)
+        e = y[i] - (x[0] - x[1] * cs)
+        H[0] = 1.0
+        H[1] = -cs
+        H[2] = -x[1] * sn
+        H[3] = H[2] * Fz[i]
+
+        hph = 0.0
+        for j in range(4):
+            acc = 0.0
+            for k in range(4):
+                acc += P[j, k] * H[k]
+            PHt[j] = acc
+            hph += H[j] * acc
+        bsin2 = x[1] * x[1] * sn * sn
+        S = hph + sA2 + bsin2 * sph2
+        if not (S > 0.0) or not np.isfinite(e):
+            return np.inf, 0
+
+        for j in range(4):
+            K[j] = PHt[j] / S
+            x[j] += K[j] * e
+        for j in range(4):
+            for k in range(4):
+                P[j, k] -= K[j] * K[k] * S
+        for j in range(4):
+            for k in range(j + 1, 4):
+                m = 0.5 * (P[j, k] + P[k, j])
+                P[j, k] = m
+                P[k, j] = m
+
+        e_out[i] = e
+        h_out[i] = hph
+        b_out[i] = bsin2
+        for j in range(4):
+            x_out[i, j] = x[j]
+        p_out[i, 0] = P[2, 2]
+        p_out[i, 1] = P[3, 3]
+
+        if i >= start:
+            nll += np.log(S) + e * e / S
+            cnt += 1
+
+    return nll, cnt
+
+
+def run_ekf_kz(alp, Fz, y, x0, P0, qd, sA, sph, T, start):
+    """Обёртка над _ekf4_core. Возвращает dict с nll, cnt, e, h, b, x (n,4), p (n,2)."""
+    n = len(alp)
+    c = 2 * np.pi * T * T * np.asarray(alp, dtype=np.float64)
+    e, h, b = np.empty(n), np.empty(n), np.empty(n)
+    x = np.empty((n, 4))
+    p = np.empty((n, 2))
+    nll, cnt = _ekf4_core(c, np.asarray(Fz, dtype=np.float64),
+                          np.asarray(y, dtype=np.float64), x0, P0, qd,
+                          sA * sA, sph * sph, start, e, h, b, x, p)
+    return {"nll": nll, "cnt": cnt, "e": e, "h": h, "b": b, "x": x, "p": p}
+
+
+def find_initial_kz(alp, y, Fz, *, n_init, T, Kz_bounds,
+                    dA_model, dB_model, dph_model, poi, warmup, win_size,
+                    tune_cfg: TuneCfg, n_particles, n_iter, pso_xtol, seed):
+    """
+    Kz и параметры EKF (sigma_A, sigma_ph, q) по первым n_init точкам -- ОДИН блок,
+    без разбиения ряда (прежняя процедура: PSO по Kz, критерии EKF и оконный cos-fit).
+    Возвращает (результат блока, EkfParams).
+    """
+    _check_cfg(tune_cfg)
+    _check_inputs(n_init, poi, warmup, win_size)
+    prm = EkfParams(T=T,
+                    q_init=np.array([dA_model ** 2, dB_model ** 2, dph_model ** 2]),
+                    poi=poi, warmup=warmup)
+    job = dict(k=0,
+               alp=np.ascontiguousarray(alp[:n_init], dtype=np.float64),
+               y=np.ascontiguousarray(y[:n_init], dtype=np.float64),
+               Fz=np.ascontiguousarray(Fz[:n_init], dtype=np.float64),
+               prm=prm, tcfg=tune_cfg, edges=make_windows(n_init, win_size),
+               Kz_bounds=(float(Kz_bounds[0]), float(Kz_bounds[1])),
+               n_particles=n_particles, n_iter=n_iter,
+               pso_xtol=pso_xtol, seed=seed)
+    _jit_warmup()
+    return _process_block(job), prm
+
+
+def kz_filter_start(alp, y, Fz, Kz0, prm, sigma_kz0):
+    """Начальные x0 (4,) и P0 (4,4): фит по первым poi точкам при Kz0; sigma_kz0 -- std Kz."""
+    poi = prm.poi
+    alp_c = compensate_alp(alp[:poi], Fz[:poi], Kz0, prm.T)
+    x3, P3, _ = initial_fit(alp_c, y[:poi], prm.T)
+    x0 = np.append(x3, Kz0)
+    P0 = np.zeros((4, 4))
+    P0[:3, :3] = P3
+    P0[3, 3] = sigma_kz0 ** 2
+    return x0, P0
+
+
+def _kz_J(alp, y, Fz, x0, P0, qd, sA, sph, prm):
+    """Средний NLL инноваций фильтра с Kz; (inf, None) при сбое."""
+    r = run_ekf_kz(alp[prm.poi:], Fz[prm.poi:], y[prm.poi:], x0, P0, qd,
+                   sA, sph, prm.T, prm.warmup)
+    if not np.isfinite(r["nll"]) or r["cnt"] == 0:
+        return np.inf, None
+    return r["nll"] / r["cnt"], r
+
+
+def tune_q_kz(alp, y, Fz, x0, P0, q3, sA, sph, prm, log_bounds, n_grid=13):
+    """
+    Подбор q_Kz (дисперсия шага Kz за цикл) по NLL инноваций на всём ряду:
+    грубая сетка по log10 q_Kz, затем уточнение вокруг лучшего узла.
+    Нижний край сетки ~ «Kz постоянен» (но всё равно уточняется фильтром).
+    Возвращает (log10 q_Kz, J_лучший, сетка, J на сетке).
+    """
+    def J_of(lq):
+        J, _ = _kz_J(alp, y, Fz, x0, P0, np.append(q3, 10.0 ** lq), sA, sph, prm)
+        return J if np.isfinite(J) else BIG_OBJ
+
+    lqs = np.linspace(log_bounds[0], log_bounds[1], n_grid)
+    Js = np.array([J_of(l) for l in lqs])
+    i = int(np.argmin(Js))
+    lq_best, J_best = float(lqs[i]), float(Js[i])
+    r = minimize_scalar(J_of, bounds=(lqs[max(i - 1, 0)], lqs[min(i + 1, n_grid - 1)]),
+                        method="bounded", options=dict(xatol=0.02))
+    if r.fun < J_best:
+        lq_best, J_best = float(r.x), float(r.fun)
+    return lq_best, J_best, lqs, Js
+
+
+def kz_filter_run(alp, y, Fz, x0, P0, qd, sA, sph, prm, g_sign=1.0):
+    """
+    Итоговый прогон фильтра с Kz. Ряды после warmup:
+    g_ugal (из ph, мкГал, без среднего), Kz(t) и его sd (из P[3,3]).
+    """
+    T, poi, w = prm.T, prm.poi, prm.warmup
+    J, r = _kz_J(alp, y, Fz, x0, P0, qd, sA, sph, prm)
+    if r is None:
+        raise RuntimeError("фильтр с Kz разошёлся")
+    ph = r["x"][w:, 2]
+    S = r["h"][w:] + sA ** 2 + r["b"][w:] * sph ** 2
+    nu = innovation_stats(r["e"][w:] / np.sqrt(S), 20)
+    return {"g_ugal": g_sign * (ph - ph.mean()) * g_per_rad(T) * UGAL,
+            "ph": ph, "Kz": r["x"][w:, 3],
+            "sd_Kz": np.sqrt(np.maximum(r["p"][w:, 1], 0.0)),
+            "J": J, "nu_std": nu["std"], "lb_p": nu["lb_pvalue"], "i_first": poi + w}
+
+
+def plot_kz_track(t_s, kz, sd, kz0, branch, kz0_label):
+    """Kz(t), найденный фильтром Калмана, с полосой ±1 sigma; Kz0 -- пунктиром."""
+    import matplotlib.pyplot as plt
+
+    div, unit = _time_unit(float(t_s[-1]))
+    t = np.asarray(t_s) / div
+    col = BRANCH_COLORS[branch]
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.fill_between(t, kz - sd, kz + sd, color=col, alpha=0.2, lw=0, label="±1σ (фильтр)")
+    ax.plot(t, kz, "-", lw=1.0, color=col, label=f"Kz(t), фильтр Калмана, чирп {branch}")
+    ax.axhline(kz0, color="gray", ls="--", lw=1, label=kz0_label)
+    ax.set_xlabel(f"Время, {unit}")
+    ax.set_ylabel("Kz")
+    ax.set_title(f"Kz как параметр фильтра Калмана, чирп {branch}")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+
+
+def _adev_at(m, adev, m_target):
+    """Значение девиации Аллана в узле, ближайшем к m_target циклов."""
+    i = int(np.argmin(np.abs(np.log(m) - np.log(m_target))))
+    return int(m[i]), float(adev[i])
 
 # =====================================================================
 # main
@@ -1659,58 +1857,50 @@ def main():
     # ---------------- данные ----------------
     DATA_PATH = r"long_data\data.txt"   # date time norm+ norm- scan+ scan- corr+ corr- offset
     BRANCH = "+"               # какую ветку чирпа обрабатывать: "+" или "-"
-    TABLE_ROWS = (0, 127000)   # строки таблицы; дальше ~128000 сигнал меняет режим (непригоден)
+    TABLE_ROWS = (0, 127000)
     T_CYCLE_NOMINAL = 0.175    # номинальный период цикла, с; None -- взять по файлу
-    SHOW_PLOT = True           # рисовать графики (файлы не сохраняются)
+    SHOW_PLOT = True
+    G_SIGN = {"+": +1.0, "-": -1.0}   # только направление оси g
 
-    # F_z = corr (в бинах, без масштаба и знака): знак вибрационной фазы входит в Kz.
-    # По прежним прогонам ожидается: "+" -> Kz ~ -5.2e-3, "-" -> Kz ~ +4.9e-3.
-    # Знак перевода фазы фринджа в g (g = G_SIGN * ph / (KEFF*T^2)) только задаёт
-    # направление оси g (усреднения по веткам больше нет).
-    G_SIGN = {"+": +1.0, "-": -1.0}
+    T = 12e-3                  # длительность плеча, с
 
-    # ---------------- интерферометр ----------------
-    T = 12e-3                    # длительность плеча, с
-
-    # ---------------- блоки ----------------
-    BLOCK_SIZE = 5000            # сбросов в блоке (~26 мин при 175 мс); остаток отбрасывается
-    MAX_BLOCKS = None            # None -- все блоки; число -- только первые N
-
-    # ---------------- поиск Kz ----------------
+    # ---------------- начальный Kz: по первым N_INIT точкам (один блок) ----------------
+    N_INIT = 1000
     KZ_BOUNDS = (-1.0, 1.0)
-    KZ_REF = None                # линия на графике (None -- не рисовать)
+    KZ_INIT_SRC = "kalman"     # откуда Kz0: "kalman" (NLL инноваций) | "window" (оконный cos-fit)
     N_PARTICLES = 10
-    N_ITER = 40                  # область широкая (оптимум ~5e-3 в диапазоне +-1)
-    PSO_XTOL = 1e-7              # остановка PSO, когда разброс частиц по Kz меньше
-    N_JOBS = None                # None -- все ядра (параллельно по блокам)
+    N_ITER = 40
+    PSO_XTOL = 1e-7
     SEED = 0
 
-    # ---------------- EKF / оконный фит ----------------
+    # ---------------- EKF ----------------
     DA_MODEL = DB_MODEL = DPH_MODEL = 1e-3   # начальные std шагов [A, B, ph]
-    POI = 200                    # точек начального фита (в каждом блоке)
-    WARMUP = 200                 # инноваций, не входящих в fitness
-    WIN_SIZE = 20                # окно оконного cos-fit
+    POI = 200                  # точек начального фита
+    WARMUP = 200               # инноваций, не входящих в fitness и в ряды g, Kz
+    WIN_SIZE = 20
 
-    # ---------------- g: EKF против фринджа, девиация Аллана ----------------
+    # ---------------- Kz как состояние ----------------
+    KZ_SIGMA0 = 1e-3           # начальная std Kz (неопределённость Kz0)
+    Q_KZ_MODE = "tune"         # "tune" -- q_Kz по NLL на всём ряду; "manual" -- из DKZ_MODEL
+    DKZ_MODEL = 1e-6           # std шага Kz за цикл (для "manual")
+    Q_KZ_LOG_BOUNDS = (-18.0, -9.0)   # границы log10 q_Kz для "tune"
+
+    # ---------------- сравнение с фринджем ----------------
     DO_ALLAN = True
-    BEST_MODE = "min_J"          # "min_J" -- блок с наименьшим J; "median" -- медианы блоков
-    KZ_MODE = "global"           # Kz при компенсации в итоговых рядах g:
-                                 #   "global" -- один Kz на весь ряд (из BEST_MODE);
-                                 #   "blocks" -- кусочно-постоянный Kz(t) по блокам
-    FRINGE_NPTS = 6              # точек фринджа в группе = длина лестницы scan
-    FRINGE_KZ = "kalman"         # источник Kz для фринджа: "kalman" | "window"
-    ALLAN_FIT_M = (6, 60)        # диапазон m (циклов) для аппроксимации белого шума S/sqrt(m)
-
-    # ---------------- чувствительность g к Kz ----------------
-    DO_KZ_SENS = True
-    DKZ_STEP = 1e-5              # шаг численной производной по Kz (Kz ~ 5e-3)
+    FRINGE_NPTS = 6
+    FRINGE_KZ_MODE = "init"    # Kz для фринджа и для EKF без Kz в состоянии:
+                               #   "init" -- Kz0; "median" -- медиана Kz(t) фильтра;
+                               #   "track" -- Kz(t) фильтра по циклам (только для фринджа)
+    ALLAN_FIT_M = (6, 60)
 
     if BRANCH not in ("+", "-"):
         raise ValueError(f"BRANCH: '+' | '-', получено {BRANCH!r}")
-    if KZ_MODE not in ("global", "blocks"):
-        raise ValueError(f"KZ_MODE: 'global' | 'blocks', получено {KZ_MODE!r}")
-    if FRINGE_KZ not in ("kalman", "window"):
-        raise ValueError(f"FRINGE_KZ: 'kalman' | 'window', получено {FRINGE_KZ!r}")
+    if KZ_INIT_SRC not in ("kalman", "window"):
+        raise ValueError(f"KZ_INIT_SRC: 'kalman' | 'window', получено {KZ_INIT_SRC!r}")
+    if Q_KZ_MODE not in ("tune", "manual"):
+        raise ValueError(f"Q_KZ_MODE: 'tune' | 'manual', получено {Q_KZ_MODE!r}")
+    if FRINGE_KZ_MODE not in ("init", "median", "track"):
+        raise ValueError(f"FRINGE_KZ_MODE: 'init' | 'median' | 'track', получено {FRINGE_KZ_MODE!r}")
 
     tune_cfg = TuneCfg(sigma_init_mode="bins",
                        tune_mode="alternate",
@@ -1722,73 +1912,106 @@ def main():
                        lbfgs_maxfun=200,
                        )
 
-    # ---------------- загрузка выбранной ветки ----------------
+    # ---------------- загрузка ----------------
     (alp, y, corr), t_cycle, tinfo = load_table_pm(
         DATA_PATH, TABLE_ROWS, branch=BRANCH, t_cycle_nominal=T_CYCLE_NOMINAL)
-    t_all = tinfo["t"]           # реальное время каждого оставшегося цикла, с
-    Fz = corr                    # бины, как есть
+    t_all = tinfo["t"]
+    Fz = corr                  # бины, как есть
     g_sign = G_SIGN[BRANCH]
+    n = len(alp)
+    npts = FRINGE_NPTS
 
-    # ---------------- Kz по блокам ----------------
-    print(f"\n{'=' * 72}\nВетка чирпа {BRANCH}\n{'=' * 72}")
-    res = run_kz_dynamics(
-        alp, y, Fz,
-        T=T, Kz_bounds=KZ_BOUNDS,
-        block_size=BLOCK_SIZE, max_blocks=MAX_BLOCKS,
-        t_cycle=t_cycle, t_axis=t_all,
+    # ================= шаг 1: Kz0 и параметры EKF по первым N_INIT точкам =================
+    print(f"\n{'=' * 72}\nШаг 1: Kz0 по первым {N_INIT} точкам (чирп {BRANCH})\n{'=' * 72}")
+    init_res, prm = find_initial_kz(
+        alp, y, Fz, n_init=N_INIT, T=T, Kz_bounds=KZ_BOUNDS,
         dA_model=DA_MODEL, dB_model=DB_MODEL, dph_model=DPH_MODEL,
-        poi=POI, warmup=WARMUP, win_size=WIN_SIZE,
-        tune_cfg=tune_cfg,
-        n_particles=N_PARTICLES, n_iter=N_ITER, pso_xtol=PSO_XTOL,
-        n_jobs=N_JOBS, seed=SEED, tag=f"[{BRANCH}] ")
-    print_summary(res, f"(чирп {BRANCH}) ")
+        poi=POI, warmup=WARMUP, win_size=WIN_SIZE, tune_cfg=tune_cfg,
+        n_particles=N_PARTICLES, n_iter=N_ITER, pso_xtol=PSO_XTOL, seed=SEED)
+    _print_block(init_res, 1, 0, N_INIT, float(np.mean(t_all[:N_INIT])), f"[{BRANCH}] ")
+    if not np.isfinite(init_res["Kz_kalman"]):
+        raise RuntimeError("EKF по первым точкам не сошёлся: нет sigma и q для фильтра")
+    kz_src = init_res["Kz_kalman"] if KZ_INIT_SRC == "kalman" else init_res["Kz_win"]
+    if not np.isfinite(kz_src):
+        raise RuntimeError(f"Kz0 ({KZ_INIT_SRC}) не найден")
+    Kz0 = float(kz_src)
+    init = {"Kz": Kz0, "sigma_A": init_res["sigma_A"], "sigma_ph": init_res["sigma_ph"],
+            "q": np.array([init_res["qA"], init_res["qB"], init_res["qph"]])}
+    print(f"  Kz0 = {Kz0:.4e} (источник: {KZ_INIT_SRC}); "
+          f"Kz(EKF) = {init_res['Kz_kalman']:.4e}, Kz(окно) = {init_res['Kz_win']:.4e}")
 
-    if SHOW_PLOT:
-        plot_kz_dynamics(res, BRANCH, kz_ref=KZ_REF)
+    # ================= шаг 2: EKF с ФИКСИРОВАННЫМ Kz0 (для сравнения) =================
+    fin3 = final_kalman_run(alp, y, Fz, init, prm, g_sign)
+    print(f"\nEKF, Kz фиксирован = {Kz0:.4e}: J={fin3['J']:.5f}, "
+          f"std(nu)={fin3['nu_std']:.3f}, LBp={fin3['lb_p']:.3f}")
 
-    # ---------------- g: EKF и фринж, Аллан ----------------
+    # ================= шаг 3: EKF с Kz в состоянии =================
+    print(f"\n{'=' * 72}\nШаг 3: фильтр Калмана с Kz в состоянии (весь ряд, {n} циклов)\n{'=' * 72}")
+    x0, P0 = kz_filter_start(alp, y, Fz, Kz0, prm, KZ_SIGMA0)
+    if Q_KZ_MODE == "tune":
+        lq, J_best, lqs, Js = tune_q_kz(alp, y, Fz, x0, P0, init["q"],
+                                        init["sigma_A"], init["sigma_ph"], prm,
+                                        Q_KZ_LOG_BOUNDS)
+        cnt = n - prm.poi - prm.warmup
+        print(f"  q_Kz подобран: log10 q_Kz = {lq:.2f} (std шага {10 ** (lq / 2):.2e} за цикл), "
+              f"J = {J_best:.5f}")
+        print(f"  Kz почти постоянен (q_Kz на нижней границе): J = {Js[0]:.5f}; "
+              f"выигрыш от дрейфа Δ(-2lnL) = {cnt * (Js[0] - J_best):.1f} "
+              f"(≳10 -- дрейф Kz значим)")
+    else:
+        lq = 2 * np.log10(DKZ_MODEL)
+        print(f"  q_Kz задан: std шага {DKZ_MODEL:.2e} за цикл")
+    qd = np.append(init["q"], 10.0 ** lq)
+    fin4 = kz_filter_run(alp, y, Fz, x0, P0, qd, init["sigma_A"], init["sigma_ph"],
+                         prm, g_sign)
+    kz_t = fin4["Kz"]
+    print(f"  J={fin4['J']:.5f}, std(nu)={fin4['nu_std']:.3f}, LBp={fin4['lb_p']:.3f}")
+    print(f"  Kz(t): начало {kz_t[0]:.4e}, конец {kz_t[-1]:.4e}, mean {kz_t.mean():.4e}, "
+          f"std {kz_t.std():.2e}, min {kz_t.min():.4e}, max {kz_t.max():.4e}; "
+          f"средняя sd фильтра {fin4['sd_Kz'].mean():.2e}")
+
+    i_first = fin4["i_first"]
+    t_k = t_all[i_first + np.arange(len(kz_t))]
+
+    # ================= фринж по npts точкам (без фильтра) =================
+    if FRINGE_KZ_MODE == "init":
+        kz_f = Kz0
+    elif FRINGE_KZ_MODE == "median":
+        kz_f = float(np.median(kz_t))
+    else:
+        kz_f = np.full(n, Kz0)
+        kz_f[i_first:] = kz_t
+    fr = fringe_npoint(alp, y, Fz, kz_f, T, npts, i_first, n, g_sign)
+    print(f"\nФринж по {npts} точкам (Kz: {FRINGE_KZ_MODE}): групп {fr['n_groups']}, "
+          f"групп с полной лестницей: {np.mean(fr['n_distinct'] == npts):.1%}")
+
+    g3, g4, gf = fin3["g_ugal"], fin4["g_ugal"], fr["g_ugal"]
+    print(f"std g: EKF (Kz фикс.) {g3.std():.3g}, EKF (Kz в состоянии) {g4.std():.3g} мкГал (по циклам); "
+          f"фринж {gf.std():.3g} мкГал ({npts}-точечные группы)")
+
+    # ================= девиация Аллана: только числа =================
     if DO_ALLAN:
-        n_use = res["n_use"]
-        prm = res["prm"]
-        Fz_u = res["Fz_all"]
-        alp_u, y_u = alp[:n_use], y[:n_use]
-        npts = FRINGE_NPTS
-        print(f"\nРежим Kz в итоговых рядах g: {KZ_MODE}")
+        print()
+        for g, cps, name in ((g3, 1, "EKF, Kz фиксирован"),
+                             (g4, 1, "EKF, Kz в состоянии"),
+                             (gf, npts, f"фринж {npts} т.")):
+            m, adev, err = adev_in_cycles(g, cps)
+            sens = white_noise_sensitivity(m, adev, *ALLAN_FIT_M)
+            m1, a1 = _adev_at(m, adev, 1000)
+            print(f"Аллан [{name}]: S = {sens:.3g} мкГал/√цикл "
+                  f"(≈ {sens * np.sqrt(t_cycle):.3g} мкГал/√Гц); "
+                  f"ADEV({m1} ц.) = {a1:.3g}, ADEV({m[-1]} ц.) = {adev[-1]:.3g} мкГал")
 
-        # --- итоговый EKF: Kz скаляр или Kz(t) по блокам ---
-        best = pick_best_kalman(res, BEST_MODE)
-        print_best(best, f"(чирп {BRANCH}) ")
-        kz_e = (kz_per_cycle(res, "Kz_kalman", best["Kz"], n_use)
-                if KZ_MODE == "blocks" else best["Kz"])
-        best_run = dict(best, Kz=kz_e)
-        fin = final_kalman_run(alp_u, y_u, Fz_u, best_run, prm, g_sign)
-        print(f"  итоговый прогон EKF ({KZ_MODE}): J={fin['J']:.5f}, "
-              f"std(nu)={fin['nu_std']:.3f}, LBp={fin['lb_p']:.3f}, "
-              f"точек g: {len(fin['g_ugal'])}")
-        i_first = fin["i_first"]
-
-        # --- фринж: и с глобальным Kz, и с Kz(t); выбираем по KZ_MODE ---
-        if FRINGE_KZ == "window":
-            kz_glob = float(np.nanmedian(res["Kz_win"]))
-            kz_blk = kz_per_cycle(res, "Kz_win", kz_glob, n_use)
-        else:
-            kz_glob = best["Kz"]
-            kz_blk = kz_per_cycle(res, "Kz_kalman", best["Kz"], n_use)
-        fr_glob = fringe_npoint(alp_u, y_u, Fz_u, kz_glob, T, npts, i_first, n_use, g_sign)
-        fr_blk = fringe_npoint(alp_u, y_u, Fz_u, kz_blk, T, npts, i_first, n_use, g_sign)
-        fr = fr_blk if KZ_MODE == "blocks" else fr_glob
-        kz_f_used = kz_blk if KZ_MODE == "blocks" else kz_glob
-        kz_txt = (f"Kz(t) по блокам ({FRINGE_KZ}), mean={np.mean(kz_blk):.4e}"
-                  if KZ_MODE == "blocks" else f"Kz={kz_glob:.4e}")
-        print(f"  фринж по {npts} точкам: {kz_txt}, групп: {fr['n_groups']}, "
-              f"медиана амплитуды B={np.median(fr['amp']):.4g}; "
-              f"групп с полной лестницей из {npts} значений чирпа: "
-              f"{np.mean(fr['n_distinct'] == npts):.1%}")
-
-
+    # ================= график: Kz(t) из фильтра =================
     if SHOW_PLOT:
         import matplotlib.pyplot as plt
-        plt.show()              # все фигуры одновременно
+        plot_kz_track(t_k, kz_t, fin4["sd_Kz"], Kz0, BRANCH,
+                      f"Kz0 по первым {N_INIT} точкам = {Kz0:.4e}")
+        plt.show()
+
+
+if __name__ == "__main__":   # если такой блок у вас уже есть в конце файла, не дублируйте
+    main()
 
 if __name__ == "__main__":
     main()
