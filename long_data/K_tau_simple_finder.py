@@ -2,41 +2,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize_scalar
 
-# sens func
-def fa(t, T, tau):
-    if 0 < t <= T+2*tau:
-        return t
-    elif T+2*tau < t <= 2*T+4*tau:
-        return 2*(T+2*tau)-t
-    else:
-        return 0
-fat_v = np.vectorize(fa, otypes=[float])   # <-- КРИТИЧНО: явно задать float
-
-
-def simpson_weights(n, h):
-    """Веса составной формулы Симпсона: h/3 * [1, 4, 2, 4, ..., 2, 4, 1]. n нечётное."""
-    if n % 2 == 0:
-        raise ValueError("для Симпсона нужно нечётное число узлов")
-    w = np.ones(n)
-    w[1:-1:2] = 4.0
-    w[2:-1:2] = 2.0
-    return w * h / 3.0
-
-def build_weight_vec(T, tau, t_step):
-    """
-    Вектор w_j = fa(t_j) * simpson_w_j. Тогда
-        интеграл a(t)*fa(t) dt  ~  az_window @ w   (Симпсон по узлам акселерометра).
-    """
-    duration = 2 * T + 4 * tau
-    n = int(round(duration / t_step)) + 1
-    if n % 2 == 0:
-        n += 1                              # fa = 0 за пределами окна, лишний узел безвреден
-    t = np.arange(n) * t_step
-    return fat_v(t, T, tau) * simpson_weights(n, t_step), n
-
-def vib_phase(az_m, delay, wvec, n):
-    """Вибрационная фаза F(tau) для всех сбросов: KEFF * integral(a * fa) dt по Симпсону."""
-    return KEFF * (az_m[:, delay:delay + n] @ wvec)
 
 
 # ------------------------------------------------------------------
@@ -82,13 +47,10 @@ def find_K(Fz, alp, P_exp, K_bounds, T):
         return float(r.x), float(r.fun)
     return float(Ks[i]), float(vals[i])
 
-def K_tau_find(K_bounds, delay_bounds, alp, P_exp, az_m, T_RP, tau, T):
-    t_step = T_RP / N_RP
-    wvec, n = build_weight_vec(T, tau, t_step)
+def K_tau_find(K_bounds, delay_bounds, alp, P_exp, Fz):
 
     hist = []  
     for delay_i in range(delay_bounds[0], delay_bounds[1], 5):
-        Fz = vib_phase(az_m, delay_i, wvec, n)
         K_i, rms_i = find_K(Fz, alp, P_exp, K_bounds, T)
         hist.append((delay_i, K_i, rms_i))
 
@@ -101,46 +63,44 @@ def K_tau_find(K_bounds, delay_bounds, alp, P_exp, az_m, T_RP, tau, T):
 # Global constants
 LM = 780e-9
 KEFF = 4*np.pi/LM
-N_RP = 16384
 
 # data init
+path, cut = r"long_data\data.txt", 127000
+norm_p, norm_m, scan_p, scan_m, corr_p, corr_m, offset = np.loadtxt(path, skiprows=1, usecols=range(2, 9), unpack=True)
+alp, P_exp, Fz = scan_p[1:cut], norm_p[1:cut], corr_p[1:cut]
 
-def load_q(path):
-    z = np.load(path)
-    q = np.concatenate([z["head"].astype(np.int64)[:, None],
-                        z["d"].astype(np.int64)], axis=1).cumsum(axis=1)
-    return z["alp"], z["P_exp"], q / float(z["scale"])
+plt.figure()
+T = 12e-3
+K = 10
+x = alp + Fz*K
+plt.scatter(x, P_exp, s=1)
+print(10 * 2 * np.pi * T ** 2 )
 
-# data = np.load(r"raw data export test\gravimeter_data.npz")
-# alp, P_exp, az_m = data["alp"], data["P_exp"], data["az_m"]
-alp, P_exp, az_m = load_q(r"raw data export test\gravimeter_data_q0.npz")
-T_RP = 33.556e-3
 
+# check shift
+# rng = np.random.default_rng()
+# Fz = rng.permutation(Fz)
 
 # QG params
-T = 10e-3
-tau = 5.1e-6
+T = 12e-3
+tau = 13.4e-6
+
 
 # search param
-delay_bounds = [0, N_RP - round((2*T+4*tau)/T_RP*N_RP) - 1]
+delay_bounds = [0, 1]
 K_bounds = [-0.1, 0.1]
 
 
-K_opt, delay_opt = K_tau_find(K_bounds, delay_bounds, alp, P_exp, az_m, T_RP, tau, T)
+K_opt, delay_opt = K_tau_find(K_bounds, delay_bounds, alp, P_exp, Fz)
 
 print(f"Optimal K ={K_opt}")
 print(f"Optimal delay ={delay_opt}")
 
-def plot_fit(K, delay, alp, P_exp, az_m, T_RP, tau, T):
+def plot_fit(K, delay, alp, P_exp, Fz, T):
     """
-    Рисует cos-fit до и после компенсации вибраций при заданных K и delay.
+    Рисует cos-fit до и после компенсации вибраций при заданном K.
     По оси X -- фаза Phi mod 2*pi, по Y -- сигнал; линия -- A - B*cos(Phi - ph).
     """
-    wvec, n = build_weight_vec(T, tau, T_RP / N_RP)
-    if delay + n > az_m.shape[1]:
-        raise ValueError(f"delay + n = {delay + n} > N_acc = {az_m.shape[1]}")
-
-    Fz = vib_phase(az_m, delay, wvec, n)
     phase0 = 2 * np.pi * T ** 2 * alp                  # без компенсации
     phase_c = phase0 - K * Fz                          # с компенсацией
 
@@ -151,7 +111,6 @@ def plot_fit(K, delay, alp, P_exp, az_m, T_RP, tau, T):
     ax_cmp = fig.add_subplot(gs[0, 1], sharey=ax_raw)
     ax_res = fig.add_subplot(gs[1, :])
 
-    rms_c = None
     for ax, phase, title in ((ax_raw, phase0, "без компенсации (K = 0)"),
                              (ax_cmp, phase_c, f"компенсация: K = {K:.4f}, delay = {delay}")):
         rms, A, B, ph = global_cosfit(phase, P_exp)
@@ -177,7 +136,6 @@ def plot_fit(K, delay, alp, P_exp, az_m, T_RP, tau, T):
     plt.show()
 
 
-plot_fit(K_opt, delay_opt, alp, P_exp, az_m, T_RP, tau, T)
-
+plot_fit(K_opt, delay_opt, alp, P_exp, Fz, T)
 
 

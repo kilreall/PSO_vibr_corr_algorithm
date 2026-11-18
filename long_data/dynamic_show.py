@@ -1143,35 +1143,29 @@ def _time_unit(tmax):
 BRANCH_COLORS = {"+": "tab:blue", "-": "tab:red"}
 
 
-def plot_kz_dynamics(branches, kz_ref=None):
-    """
-    График Kz(t) для обеих веток чирпа: EKF и оконный cos-fit.
-    branches: {"+": res_plus, "-": res_minus} -- результаты run_kz_dynamics.
-    Окно отображается общим plt.show() в main.
-    """
+def plot_kz_dynamics(res, branch, kz_ref=None):
+    """График Kz(t) для выбранной ветки: EKF и оконный cos-fit."""
     import matplotlib.pyplot as plt
 
-    tmax = max(float(np.nanmax(np.asarray(r["t_s"], dtype=float)))
-               for r in branches.values() if len(r["t_s"]))
-    div, unit = _time_unit(tmax)
+    t_s = np.asarray(res["t_s"], dtype=float)
+    div, unit = _time_unit(float(np.nanmax(t_s)))
+    t = t_s / div
+    col = BRANCH_COLORS[branch]
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    for sg, res in branches.items():
-        t = np.asarray(res["t_s"], dtype=float) / div
-        col = BRANCH_COLORS[sg]
-        ax.plot(t, res["Kz_kalman"], "o-", ms=4, color=col,
-                label=f"EKF (NLL инноваций), чирп {sg}")
-        ax.plot(t, res["Kz_win"], "s--", ms=4, color=col, alpha=0.55,
-                label=f"оконный cos-fit, чирп {sg}")
+    ax.plot(t, res["Kz_kalman"], "o-", ms=4, color=col,
+            label=f"EKF (NLL инноваций), чирп {branch}")
+    ax.plot(t, res["Kz_win"], "s--", ms=4, color=col, alpha=0.55,
+            label=f"оконный cos-fit, чирп {branch}")
     if kz_ref is not None:
         ax.axhline(kz_ref, color="gray", ls=":", lw=1, label=f"Kz = {kz_ref:g}")
-    bs = next(iter(branches.values()))["block_size"]
     ax.set_xlabel(f"Время, {unit} (центр блока)")
     ax.set_ylabel("Kz")
-    ax.set_title(f"Динамика Kz по блокам ({bs} сбросов)")
+    ax.set_title(f"Динамика Kz по блокам ({res['block_size']} сбросов), чирп {branch}")
     ax.grid(alpha=0.3)
     ax.legend()
     fig.tight_layout()
+
 
 
 def print_summary(res, label=""):
@@ -1383,31 +1377,29 @@ def _spike_mask(y, alp, k=8.0, win=41):
     return out
 
 
-def load_table_pm(path, row_range=None, corr_max=60.0, spike_k=8.0,
+def load_table_pm(path, row_range=None, branch="+", corr_max=60.0, spike_k=8.0,
                   t_cycle_nominal=None):
     """
     Читает таблицу data.txt: date time norm+ norm- scan+ scan- corr+ corr- offset
     (одна строка = один цикл, плюс и минус лежат в РАЗНЫХ колонках одной строки).
-    Возвращает ОБЕ ветки сразу.
+    Возвращает ОДНУ выбранную ветку (branch = "+" или "-").
 
-    row_range: (i0, i1) -- какие строки файла брать (None -- все). Нужен, потому что
-    после перехода режима (сигнал сменил уровень и стал на порядок шумнее) данные
-    для EKF непригодны, а это не выброс, а другой режим.
-    Роли: alp = scan, P_exp = norm, corr = ускорение в бинах (масштаб и знак
-    приводятся к F_z в main).
-    Строка выбрасывается ЦЕЛИКОМ (для обоих знаков, чтобы ряды двух веток оставались
-    согласованными по циклам), если |corr| > corr_max у любого знака или сигнал
-    любого знака -- выброс (_spike_mask).
+    row_range: (i0, i1) -- какие строки файла брать (None -- все).
+    Роли: alp = scan, P_exp = norm, corr = ускорение в бинах (используется как F_z
+    без масштаба и знака: они входят в Kz).
+    Строка выбрасывается, если |corr| > corr_max или сигнал -- выброс (_spike_mask)
+    у ВЫБРАННОЙ ветки.
 
     t_cycle_nominal: номинальный период цикла, с (None -- брать по файлу).
 
     Возвращает (data, t_cycle, info):
-      data = {"+": (alp, P_exp, corr), "-": (alp, P_exp, corr)};
+      data = (alp, P_exp, corr);
       t_cycle -- номинальный период (если задан) либо средний по файлу, с;
       info["t"] -- реальное время оставшихся строк, с (от первой строки диапазона);
-      info["t_cycle_file"] -- средний период по оставшимся строкам (включает
-      пропуски из-за выброшенных строк).
+      info["t_cycle_file"] -- средний период по оставшимся строкам.
     """
+    if branch not in ("+", "-"):
+        raise ValueError(f"branch: '+' | '-', получено {branch!r}")
     meta = np.loadtxt(path, dtype=str, skiprows=1, usecols=(0, 1))
     num = np.loadtxt(path, skiprows=1, usecols=range(2, 9))
     t = np.char.add(np.char.add(meta[:, 0], "T"), meta[:, 1]).astype("datetime64[ms]")
@@ -1418,23 +1410,21 @@ def load_table_pm(path, row_range=None, corr_max=60.0, spike_k=8.0,
     t = t - t[0]
 
     y_p, y_m, a_p, a_m, c_p, c_m = (num[:, i] for i in range(6))
-    bad = (np.abs(c_p) > corr_max) | (np.abs(c_m) > corr_max)
+    y, a, c = (y_p, a_p, c_p) if branch == "+" else (y_m, a_m, c_m)
+
+    bad = np.abs(c) > corr_max
     n_corr = int(bad.sum())
-    bad |= _spike_mask(y_p, a_p, spike_k) | _spike_mask(y_m, a_m, spike_k)
+    bad |= _spike_mask(y, a, spike_k)
     keep = ~bad
 
-    def pick(*arrs):
-        return tuple(np.ascontiguousarray(a[keep]) for a in arrs)
-
-    data = {"+": pick(a_p, y_p, c_p), "-": pick(a_m, y_m, c_m)}
+    data = tuple(np.ascontiguousarray(v[keep]) for v in (a, y, c))
     t_keep = np.ascontiguousarray(t[keep])
     t_file = float((t_keep[-1] - t_keep[0]) / (keep.sum() - 1))
     t_cycle = float(t_cycle_nominal) if t_cycle_nominal else t_file
     info = {"n_total": len(bad), "n_bad": int(bad.sum()), "n_bad_corr": n_corr,
             "t": t_keep, "t_cycle_file": t_file}
-    print(f"Таблица {path}: {len(bad)} строк, выброшено {info['n_bad']} "
-          f"(из них |corr|>{corr_max:g}: {n_corr}); осталось {int(keep.sum())} циклов "
-          f"в каждой ветке")
+    print(f"Таблица {path}, ветка {branch}: {len(bad)} строк, выброшено {info['n_bad']} "
+          f"(из них |corr|>{corr_max:g}: {n_corr}); осталось {int(keep.sum())} циклов")
     print(f"Период цикла: по файлу {t_file * 1e3:.2f} мс (с учётом пропусков), "
           f"используется {t_cycle * 1e3:.2f} мс"
           + (" (номинал)" if t_cycle_nominal else ""))
@@ -1607,30 +1597,6 @@ def kz_sensitivity_ekf(alp, y, Fz, best, prm, g_sign, dKz=0.02):
     return g_sign * (p1 - p0) / dKz * g_per_rad(prm.T) * UGAL
 
 
-def plot_kz_effect(t_f, sens, effect):
-    """
-    Две панели: (1) dg/dKz по группам фринджа для веток и среднего (мкГал на ед. Kz);
-    (2) эффект Kz(t) на g: g(Kz по блокам) - g(глобальный Kz), среднее по веткам.
-    """
-    import matplotlib.pyplot as plt
-
-    div, unit = _time_unit(float(t_f[-1]))
-    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
-    ax = axes[0]
-    ax.plot(t_f / div, sens["+"], "-", lw=0.7, color=BRANCH_COLORS["+"], alpha=0.7, label="чирп +")
-    ax.plot(t_f / div, sens["-"], "-", lw=0.7, color=BRANCH_COLORS["-"], alpha=0.7, label="чирп −")
-    ax.plot(t_f / div, sens["mean"], "-", lw=1.2, color="k", label="среднее")
-    ax.set_ylabel("dg/dKz, мкГал / ед. Kz")
-    ax.set_title("Чувствительность g к Kz (фринж)")
-    ax.grid(alpha=0.3)
-    ax.legend(fontsize=8)
-    ax = axes[1]
-    ax.plot(t_f / div, effect, "-", lw=0.8, color="tab:green")
-    ax.set_ylabel("Δg, мкГал")
-    ax.set_xlabel(f"Время, {unit}")
-    ax.set_title("Эффект Kz(t): g(Kz по блокам) − g(глобальный Kz), среднее по веткам")
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
 
 
 # =====================================================================
@@ -1683,66 +1649,6 @@ def white_noise_sensitivity(ms, adev, m_lo, m_hi):
     return float(np.exp(np.mean(np.log(adev[sel] * np.sqrt(ms[sel])))))
 
 
-def plot_allan_compare(curves, t_cycle, fit_m, title=""):
-    """
-    Девиация Аллана g (log-log, ось x -- число циклов) для нескольких рядов на одном графике.
-    curves: список dict(label, m, adev, err, sens, color, [fmt], [alpha]).
-    В подписи -- чувствительность каждого ряда.
-    """
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(9, 6))
-    notes = []
-    for c in curves:
-        ax.errorbar(c["m"], c["adev"], yerr=c["err"], fmt=c.get("fmt", "o-"), ms=4,
-                    capsize=3, color=c["color"], alpha=c.get("alpha", 1.0),
-                    label=c["label"])
-        mm = np.array([c["m"][0], c["m"][-1]], dtype=float)
-        ax.plot(mm, c["sens"] / np.sqrt(mm), "--", lw=1, color=c["color"], alpha=0.7)
-        notes.append(f"{c['label']}: {c['sens']:.3g} мкГал/√цикл "
-                     f"≈ {c['sens'] * np.sqrt(t_cycle):.3g} мкГал/√Гц")
-    ax.plot([], [], "k--", lw=1, label=r"белый шум $S/\sqrt{m}$")
-    ax.axvspan(fit_m[0], fit_m[1], color="gray", alpha=0.10, lw=0)
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel("Число усредняемых циклов m")
-    ax.set_ylabel("Девиация Аллана g, мкГал")
-    ax.set_title(title or "Девиация Аллана g")
-    ax.grid(True, which="both", alpha=0.3)
-    ax.legend(loc="lower left")
-    ax.text(0.97, 0.96,
-            "Чувствительность (период %.4g мс):\n" % (t_cycle * 1e3) + "\n".join(notes),
-            transform=ax.transAxes, ha="right", va="top", fontsize=8,
-            bbox=dict(boxstyle="round", fc="white", ec="gray", alpha=0.9))
-    fig.tight_layout()
-
-
-def plot_g_compare(t_k, g_k, t_f, g_f, npts, title=""):
-    """
-    g(t) для EKF и фринджа по npts точкам на одном графике.
-    Три панели: среднее по ветвям, ветка "+", ветка "-".
-    g_k, g_f: dict с ключами "mean", "+", "-" (мкГал, без среднего);
-    t_k, t_f -- время, с, для EKF (каждый цикл) и фринджа (центр группы).
-    """
-    import matplotlib.pyplot as plt
-
-    div, unit = _time_unit(float(max(t_k[-1], t_f[-1])))
-    panels = (("mean", "среднее g = (g₊ + g₋)/2"),
-              ("+", "ветка чирпа «+»"),
-              ("-", "ветка чирпа «−»"))
-    fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
-    for ax, (key, name) in zip(axes, panels):
-        ax.plot(t_k / div, g_k[key], "-", lw=0.6, color="tab:blue", alpha=0.8,
-                label="EKF (по циклам)")
-        ax.plot(t_f / div, g_f[key], "o", ms=2.5, color="tab:orange", alpha=0.7,
-                label=f"фринж, {npts} точек (без фильтра)")
-        ax.set_ylabel("g, мкГал")
-        ax.set_title(name, fontsize=10)
-        ax.grid(alpha=0.3)
-        ax.legend(loc="upper right", fontsize=8)
-    axes[-1].set_xlabel(f"Время, {unit}")
-    fig.suptitle(title or "Ряд g: EKF и фринж по точкам")
-    fig.tight_layout()
 
 
 # =====================================================================
@@ -1752,37 +1658,30 @@ def plot_g_compare(t_k, g_k, t_f, g_f, npts, title=""):
 def main():
     # ---------------- данные ----------------
     DATA_PATH = r"long_data\data.txt"   # date time norm+ norm- scan+ scan- corr+ corr- offset
-    CORR_PER_G = 2048.0        # бинов corr на 1 g (F_z = знак * corr / CORR_PER_G)
+    BRANCH = "+"               # какую ветку чирпа обрабатывать: "+" или "-"
     TABLE_ROWS = (0, 127000)   # строки таблицы; дальше ~128000 сигнал меняет режим (непригоден)
-    T_CYCLE_NOMINAL = 0.175    # номинальный период цикла (+ и -), с; None -- взять по файлу
+    T_CYCLE_NOMINAL = 0.175    # номинальный период цикла, с; None -- взять по файлу
     SHOW_PLOT = True           # рисовать графики (файлы не сохраняются)
 
-    # Знак F_z для каждой ветки: подобран эмпирически -- на сырых corr оптимум Kz
-    # отрицателен для "+" и положителен для "-" (обращение k_eff меняет знак
-    # вибрационной фазы).
-    FZ_SIGN = {"+": -1.0, "-": +1.0}
-    # Знак перевода фазы фринджа в g (g = G_SIGN * ph / (KEFF*T^2)). При обращении
-    # k_eff фаза от g меняет знак, поэтому у веток он противоположный, и именно тогда
-    # k-независимые фазовые сдвиги сокращаются в среднем (g_+ + g_-)/2. Общий знак
-    # (какая ветка "+") задаёт направление оси g; ПРОВЕРЯЕТСЯ по корреляции g_+ и g_-
-    # (должна быть положительной), при отрицательной -- поменяйте знак одной ветки.
+    # F_z = corr (в бинах, без масштаба и знака): знак вибрационной фазы входит в Kz.
+    # По прежним прогонам ожидается: "+" -> Kz ~ -5.2e-3, "-" -> Kz ~ +4.9e-3.
+    # Знак перевода фазы фринджа в g (g = G_SIGN * ph / (KEFF*T^2)) только задаёт
+    # направление оси g (усреднения по веткам больше нет).
     G_SIGN = {"+": +1.0, "-": -1.0}
 
     # ---------------- интерферометр ----------------
     T = 12e-3                    # длительность плеча, с
 
     # ---------------- блоки ----------------
-    BLOCK_SIZE = 9000            # сбросов в блоке (~26 мин при 175 мс); остаток отбрасывается
+    BLOCK_SIZE = 5000            # сбросов в блоке (~26 мин при 175 мс); остаток отбрасывается
     MAX_BLOCKS = None            # None -- все блоки; число -- только первые N
 
-    # ---------------- поиск Kz (отдельно для каждой ветки) ----------------
-    # F_z = знак * corr / CORR_PER_G, Kz ~ 9.8 (g -> м/с^2).
-    # Пробный скан при CORR_PER_G = 2048 дал Kz ~ 10.7 для "+" и ~ 10.1 для "-".
-    KZ_BOUNDS = (1.0, 20.0)
-    KZ_REF = 9.80665             # линия на графике (None -- не рисовать)
+    # ---------------- поиск Kz ----------------
+    KZ_BOUNDS = (-1.0, 1.0)
+    KZ_REF = None                # линия на графике (None -- не рисовать)
     N_PARTICLES = 10
-    N_ITER = 20
-    PSO_XTOL = 1e-4              # остановка PSO, когда разброс частиц по Kz меньше
+    N_ITER = 40                  # область широкая (оптимум ~5e-3 в диапазоне +-1)
+    PSO_XTOL = 1e-7              # остановка PSO, когда разброс частиц по Kz меньше
     N_JOBS = None                # None -- все ядра (параллельно по блокам)
     SEED = 0
 
@@ -1798,26 +1697,21 @@ def main():
     KZ_MODE = "global"           # Kz при компенсации в итоговых рядах g:
                                  #   "global" -- один Kz на весь ряд (из BEST_MODE);
                                  #   "blocks" -- кусочно-постоянный Kz(t) по блокам
-    FRINGE_NPTS = 6              # точек фринджа в группе = длина лестницы scan (метод без фильтра Калмана)
-    FRINGE_KZ = "kalman"         # источник Kz для фринджа: "kalman" -- тот же, что в EKF;
-                                 # "window" -- Kz оконного cos-fit (глобально: медиана по блокам)
-    ALLAN_FIT_M = (6, 60)        # диапазон m (циклов), где аппроксимируется белый шум S/sqrt(m)
-    ALLAN_SHOW_BRANCHES = False  # True -- добавить на график Аллана ряды веток "+" и "-"
+    FRINGE_NPTS = 6              # точек фринджа в группе = длина лестницы scan
+    FRINGE_KZ = "kalman"         # источник Kz для фринджа: "kalman" | "window"
+    ALLAN_FIT_M = (6, 60)        # диапазон m (циклов) для аппроксимации белого шума S/sqrt(m)
 
     # ---------------- чувствительность g к Kz ----------------
     DO_KZ_SENS = True
-    DKZ_STEP = 0.02              # шаг численной производной по Kz
+    DKZ_STEP = 1e-5              # шаг численной производной по Kz (Kz ~ 5e-3)
 
+    if BRANCH not in ("+", "-"):
+        raise ValueError(f"BRANCH: '+' | '-', получено {BRANCH!r}")
     if KZ_MODE not in ("global", "blocks"):
         raise ValueError(f"KZ_MODE: 'global' | 'blocks', получено {KZ_MODE!r}")
     if FRINGE_KZ not in ("kalman", "window"):
         raise ValueError(f"FRINGE_KZ: 'kalman' | 'window', получено {FRINGE_KZ!r}")
 
-    # "alternate": чередование R -> Q с линейным поиском по настоящему J (см. _tune_alternate);
-    # "joint" -- подбор sigma и q вместе, даёт те же J, но медленнее.
-    # Границы q: log10 q в [-13, -4] (прежние +-3 декады вокруг q_init = 1e-6 упирались
-    # в нижнюю границу 1e-9: q_B во всех блоках, q_A и q_ph -- в части блоков).
-    # lbfgs_maxfun увеличен: область шире, шагов нужно больше.
     tune_cfg = TuneCfg(sigma_init_mode="bins",
                        tune_mode="alternate",
                        r_method="fisher",
@@ -1828,186 +1722,73 @@ def main():
                        lbfgs_maxfun=200,
                        )
 
-    # ---------------- загрузка: обе ветки из одной таблицы ----------------
-    data, t_cycle, tinfo = load_table_pm(DATA_PATH, TABLE_ROWS,
-                                         t_cycle_nominal=T_CYCLE_NOMINAL)
+    # ---------------- загрузка выбранной ветки ----------------
+    (alp, y, corr), t_cycle, tinfo = load_table_pm(
+        DATA_PATH, TABLE_ROWS, branch=BRANCH, t_cycle_nominal=T_CYCLE_NOMINAL)
     t_all = tinfo["t"]           # реальное время каждого оставшегося цикла, с
+    Fz = corr                    # бины, как есть
+    g_sign = G_SIGN[BRANCH]
 
-    # ---------------- Kz по блокам: отдельно для "+" и "-" ----------------
-    branches = {}
-    for sg in ("+", "-"):
-        alp, y, corr = data[sg]
-        Fz = FZ_SIGN[sg] * corr / CORR_PER_G
-        print(f"\n{'=' * 72}\nВетка чирпа {sg}\n{'=' * 72}")
-        res = run_kz_dynamics(
-            alp, y, Fz,
-            T=T, Kz_bounds=KZ_BOUNDS,
-            block_size=BLOCK_SIZE, max_blocks=MAX_BLOCKS,
-            t_cycle=t_cycle, t_axis=t_all,
-            dA_model=DA_MODEL, dB_model=DB_MODEL, dph_model=DPH_MODEL,
-            poi=POI, warmup=WARMUP, win_size=WIN_SIZE,
-            tune_cfg=tune_cfg,
-            n_particles=N_PARTICLES, n_iter=N_ITER, pso_xtol=PSO_XTOL,
-            n_jobs=N_JOBS, seed=SEED, tag=f"[{sg}] ")
-        print_summary(res, f"(чирп {sg}) ")
-        branches[sg] = {"alp": alp, "y": y, "res": res}
+    # ---------------- Kz по блокам ----------------
+    print(f"\n{'=' * 72}\nВетка чирпа {BRANCH}\n{'=' * 72}")
+    res = run_kz_dynamics(
+        alp, y, Fz,
+        T=T, Kz_bounds=KZ_BOUNDS,
+        block_size=BLOCK_SIZE, max_blocks=MAX_BLOCKS,
+        t_cycle=t_cycle, t_axis=t_all,
+        dA_model=DA_MODEL, dB_model=DB_MODEL, dph_model=DPH_MODEL,
+        poi=POI, warmup=WARMUP, win_size=WIN_SIZE,
+        tune_cfg=tune_cfg,
+        n_particles=N_PARTICLES, n_iter=N_ITER, pso_xtol=PSO_XTOL,
+        n_jobs=N_JOBS, seed=SEED, tag=f"[{BRANCH}] ")
+    print_summary(res, f"(чирп {BRANCH}) ")
 
     if SHOW_PLOT:
-        plot_kz_dynamics({sg: b["res"] for sg, b in branches.items()}, kz_ref=KZ_REF)
+        plot_kz_dynamics(res, BRANCH, kz_ref=KZ_REF)
 
-    # ---------------- g: EKF и фринж, среднее по веткам, Аллан ----------------
+    # ---------------- g: EKF и фринж, Аллан ----------------
     if DO_ALLAN:
-        n_use = branches["+"]["res"]["n_use"]
-        if branches["-"]["res"]["n_use"] != n_use:
-            raise RuntimeError("ветки имеют разное число используемых циклов")
-        prm = branches["+"]["res"]["prm"]
+        n_use = res["n_use"]
+        prm = res["prm"]
+        Fz_u = res["Fz_all"]
+        alp_u, y_u = alp[:n_use], y[:n_use]
+        npts = FRINGE_NPTS
         print(f"\nРежим Kz в итоговых рядах g: {KZ_MODE}")
 
-        fin, fr = {}, {}
-        fr_glob, fr_blk = {}, {}       # фринж с глобальным Kz и с Kz(t) по блокам
-        best_run, kz_f_used = {}, {}
-        for sg in ("+", "-"):
-            b = branches[sg]
-            res = b["res"]
-            best = pick_best_kalman(res, BEST_MODE)
-            print_best(best, f"(чирп {sg}) ")
+        # --- итоговый EKF: Kz скаляр или Kz(t) по блокам ---
+        best = pick_best_kalman(res, BEST_MODE)
+        print_best(best, f"(чирп {BRANCH}) ")
+        kz_e = (kz_per_cycle(res, "Kz_kalman", best["Kz"], n_use)
+                if KZ_MODE == "blocks" else best["Kz"])
+        best_run = dict(best, Kz=kz_e)
+        fin = final_kalman_run(alp_u, y_u, Fz_u, best_run, prm, g_sign)
+        print(f"  итоговый прогон EKF ({KZ_MODE}): J={fin['J']:.5f}, "
+              f"std(nu)={fin['nu_std']:.3f}, LBp={fin['lb_p']:.3f}, "
+              f"точек g: {len(fin['g_ugal'])}")
+        i_first = fin["i_first"]
 
-            # --- итоговый EKF: Kz скаляр или Kz(t) по блокам ---
-            kz_e = (kz_per_cycle(res, "Kz_kalman", best["Kz"], n_use)
-                    if KZ_MODE == "blocks" else best["Kz"])
-            best_run[sg] = dict(best, Kz=kz_e)
-            fin[sg] = final_kalman_run(b["alp"][:n_use], b["y"][:n_use], res["Fz_all"],
-                                       best_run[sg], prm, G_SIGN[sg])
-            print(f"  итоговый прогон EKF ({KZ_MODE}): J={fin[sg]['J']:.5f}, "
-                  f"std(nu)={fin[sg]['nu_std']:.3f}, LBp={fin[sg]['lb_p']:.3f}, "
-                  f"точек g: {len(fin[sg]['g_ugal'])}")
+        # --- фринж: и с глобальным Kz, и с Kz(t); выбираем по KZ_MODE ---
+        if FRINGE_KZ == "window":
+            kz_glob = float(np.nanmedian(res["Kz_win"]))
+            kz_blk = kz_per_cycle(res, "Kz_win", kz_glob, n_use)
+        else:
+            kz_glob = best["Kz"]
+            kz_blk = kz_per_cycle(res, "Kz_kalman", best["Kz"], n_use)
+        fr_glob = fringe_npoint(alp_u, y_u, Fz_u, kz_glob, T, npts, i_first, n_use, g_sign)
+        fr_blk = fringe_npoint(alp_u, y_u, Fz_u, kz_blk, T, npts, i_first, n_use, g_sign)
+        fr = fr_blk if KZ_MODE == "blocks" else fr_glob
+        kz_f_used = kz_blk if KZ_MODE == "blocks" else kz_glob
+        kz_txt = (f"Kz(t) по блокам ({FRINGE_KZ}), mean={np.mean(kz_blk):.4e}"
+                  if KZ_MODE == "blocks" else f"Kz={kz_glob:.4e}")
+        print(f"  фринж по {npts} точкам: {kz_txt}, групп: {fr['n_groups']}, "
+              f"медиана амплитуды B={np.median(fr['amp']):.4g}; "
+              f"групп с полной лестницей из {npts} значений чирпа: "
+              f"{np.mean(fr['n_distinct'] == npts):.1%}")
 
-            # --- фринж: считаем и с глобальным Kz, и с Kz(t); выбираем по KZ_MODE ---
-            if FRINGE_KZ == "window":
-                kz_glob = float(np.nanmedian(res["Kz_win"]))
-                kz_blk = kz_per_cycle(res, "Kz_win", kz_glob, n_use)
-            else:
-                kz_glob = best["Kz"]
-                kz_blk = kz_per_cycle(res, "Kz_kalman", best["Kz"], n_use)
-            i_first_b = fin[sg]["i_first"]
-            fr_glob[sg] = fringe_npoint(b["alp"][:n_use], b["y"][:n_use], res["Fz_all"],
-                                        kz_glob, T, FRINGE_NPTS, i_first_b, n_use, G_SIGN[sg])
-            fr_blk[sg] = fringe_npoint(b["alp"][:n_use], b["y"][:n_use], res["Fz_all"],
-                                       kz_blk, T, FRINGE_NPTS, i_first_b, n_use, G_SIGN[sg])
-            fr[sg] = fr_blk[sg] if KZ_MODE == "blocks" else fr_glob[sg]
-            kz_f_used[sg] = kz_blk if KZ_MODE == "blocks" else kz_glob
-            kz_txt = (f"Kz(t) по блокам ({FRINGE_KZ}), mean={np.mean(kz_blk):.5f}"
-                      if KZ_MODE == "blocks" else f"Kz={kz_glob:.5f}")
-            print(f"  фринж по {FRINGE_NPTS} точкам: {kz_txt}, групп: {fr[sg]['n_groups']}, "
-                  f"медиана амплитуды B={np.median(fr[sg]['amp']):.4g}; "
-                  f"групп с полной лестницей из {FRINGE_NPTS} значений чирпа: "
-                  f"{np.mean(fr[sg]['n_distinct'] == FRINGE_NPTS):.1%}")
-
-        i_first = fin["+"]["i_first"]
-        npts = FRINGE_NPTS
-
-        # --- ряды g: ветки и среднее ---
-        g_k = {"+": fin["+"]["g_ugal"], "-": fin["-"]["g_ugal"]}
-        g_k["mean"] = 0.5 * (g_k["+"] + g_k["-"])
-        g_f = {"+": fr["+"]["g_ugal"], "-": fr["-"]["g_ugal"]}
-        g_f["mean"] = 0.5 * (g_f["+"] + g_f["-"])
-        # реальное время: каждого цикла (EKF) и центра группы (фринж)
-        t_k = t_all[i_first + np.arange(len(g_k["mean"]))]
-        t_f = np.interp(fr["+"]["i_center"], np.arange(len(t_all)), t_all)
-
-        # --- проверки ---
-        r_k = branch_consistency(g_k["+"], g_k["-"], npts)
-        r_f = float(np.corrcoef(g_f["+"], g_f["-"])[0, 1])
-        print(f"\nКорреляция g_+ и g_- (должна быть > 0 при верных G_SIGN): "
-              f"EKF {r_k:+.3f}, фринж {r_f:+.3f}")
-        if r_k < 0 or r_f < 0:
-            print("  ВНИМАНИЕ: корреляция отрицательна -- проверьте знак G_SIGN одной из веток")
-        n_g = fr["+"]["n_groups"]
-        k_avg = g_k["mean"][:n_g * npts].reshape(n_g, npts).mean(axis=1)
-        print(f"Среднее g: std EKF = {g_k['mean'].std():.3g} мкГал (по циклам), "
-              f"std фринж = {g_f['mean'].std():.3g} мкГал ({npts}-точечные группы); "
-              f"std(EKF усредн. по группам - фринж) = {np.std(k_avg - g_f['mean']):.3g} мкГал")
-
-        # --- график g: EKF и фринж на одном графике ---
-        if SHOW_PLOT:
-            plot_g_compare(t_k, g_k, t_f, g_f, npts,
-                           f"Ряд g (среднее по ветвям ±): EKF и фринж по точкам, Kz: {KZ_MODE}")
-
-        # --- девиация Аллана: EKF и фринж на одном графике ---
-        series = [("mean", "среднее", "tab:blue", "tab:orange")]
-        if ALLAN_SHOW_BRANCHES:
-            series += [("+", "чирп +", "tab:cyan", "tab:olive"),
-                       ("-", "чирп −", "tab:purple", "tab:brown")]
-        curves = []
-        for key, lab, col_k, col_f in series:
-            for g, cps, name, col in ((g_k[key], 1, "EKF", col_k),
-                                      (g_f[key], npts, f"фринж {npts} т.", col_f)):
-                m, adev, err = adev_in_cycles(g, cps)
-                sens = white_noise_sensitivity(m, adev, *ALLAN_FIT_M)
-                main_curve = key == "mean"
-                curves.append(dict(label=f"{name}, {lab}", m=m, adev=adev, err=err, sens=sens,
-                                   color=col, fmt="o-" if main_curve else "-",
-                                   alpha=1.0 if main_curve else 0.6))
-                print(f"Аллан [{name}, {lab}]: S = {sens:.3g} мкГал/√цикл "
-                      f"(≈ {sens * np.sqrt(t_cycle):.3g} мкГал/√Гц); "
-                      f"ADEV({m[0]} ц.) = {adev[0]:.3g}, ADEV({m[-1]} ц.) = {adev[-1]:.3g} мкГал")
-        if SHOW_PLOT:
-            plot_allan_compare(curves, t_cycle, ALLAN_FIT_M,
-                               "Девиация Аллана g: EKF и фринж по точкам")
-
-        # ---------------- чувствительность g к Kz ----------------
-        if DO_KZ_SENS:
-            print(f"\n{'=' * 72}\nЧувствительность g к Kz (шаг {DKZ_STEP:g})\n{'=' * 72}")
-            sens_f, sens_k, kz_sd = {}, {}, {}
-            for sg in ("+", "-"):
-                b, res = branches[sg], branches[sg]["res"]
-                # производная берётся при том Kz, которым считаются итоговые ряды
-                sens_f[sg] = kz_sensitivity_fringe(
-                    b["alp"][:n_use], b["y"][:n_use], res["Fz_all"], kz_f_used[sg], T,
-                    npts, i_first, n_use, G_SIGN[sg], DKZ_STEP)
-                sens_k[sg] = kz_sensitivity_ekf(
-                    b["alp"][:n_use], b["y"][:n_use], res["Fz_all"], best_run[sg],
-                    prm, G_SIGN[sg], DKZ_STEP)
-                kz_sd[sg] = float(np.nanstd(res["Kz_kalman"], ddof=1))   # разброс Kz по блокам
-                sf = sens_f[sg]
-                print(f"[{sg}] dg/dKz, мкГал/ед.Kz: фринж mean={sf.mean():+.4g}, "
-                      f"std по группам={sf.std():.3g}; EKF mean={sens_k[sg].mean():+.4g}, "
-                      f"std по циклам={sens_k[sg].std():.3g}")
-                print(f"     разброс Kz по блокам std={kz_sd[sg]:.3g} -> g: "
-                      f"сдвиг ~ {abs(sf.mean()) * kz_sd[sg]:.3g} мкГал, "
-                      f"шум по группам ~ {sf.std() * kz_sd[sg]:.3g} мкГал")
-
-            s_mean = 0.5 * (sens_f["+"] + sens_f["-"])
-            # ошибки Kz двух веток: коррелированы (одинаковый знак вклада в среднее)
-            # или независимы -- вилка оценки сдвига среднего g
-            shift_corr = 0.5 * (abs(sens_f["+"].mean()) * kz_sd["+"]
-                                + abs(sens_f["-"].mean()) * kz_sd["-"])
-            shift_ind = 0.5 * np.hypot(sens_f["+"].mean() * kz_sd["+"],
-                                       sens_f["-"].mean() * kz_sd["-"])
-            print(f"Среднее по ветвям: dg/dKz mean={s_mean.mean():+.4g}, "
-                  f"std по группам={s_mean.std():.3g} мкГал/ед.Kz")
-            print(f"Сдвиг среднего g из-за разброса Kz по блокам: "
-                  f"независимые ошибки ~ {shift_ind:.3g} мкГал, "
-                  f"общая ошибка (худший случай) ~ {shift_corr:.3g} мкГал")
-            dkz = float(np.mean(best_run["+"]["Kz"]) - np.mean(best_run["-"]["Kz"]))
-            print(f"Разница Kz(+)-Kz(-) по прогонам: {dkz:+.4f}")
-
-            # --- эффект Kz(t): фринж с Kz по блокам минус фринж с глобальным Kz ---
-            g_glob_mean = 0.5 * (fr_glob["+"]["g_ugal"] + fr_glob["-"]["g_ugal"])
-            g_blk_mean = 0.5 * (fr_blk["+"]["g_ugal"] + fr_blk["-"]["g_ugal"])
-            effect = g_blk_mean - g_glob_mean
-            print(f"Эффект Kz(t) на g (фринж, среднее по ветвям; блоки минус глобальный Kz): "
-                  f"std={effect.std():.3g} мкГал, размах={np.ptp(effect):.3g} мкГал; "
-                  f"для сравнения std g (глобальный Kz)={g_glob_mean.std():.3g} мкГал")
-
-            if SHOW_PLOT:
-                plot_kz_effect(t_f, {"+": sens_f["+"], "-": sens_f["-"], "mean": s_mean},
-                               effect)
 
     if SHOW_PLOT:
         import matplotlib.pyplot as plt
         plt.show()              # все фигуры одновременно
-
 
 if __name__ == "__main__":
     main()
