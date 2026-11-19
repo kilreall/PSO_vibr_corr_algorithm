@@ -2274,6 +2274,101 @@ def _adev_at(m, adev, m_target):
     i = int(np.argmin(np.abs(np.log(m) - np.log(m_target))))
     return int(m[i]), float(adev[i])
 
+def _adev_interp(m, adev, m_t):
+    """Девиация Аллана при m_t циклов (лог-лог интерполяция); NaN вне диапазона."""
+    if m_t < m[0] or m_t > m[-1]:
+        return np.nan
+    return float(np.exp(np.interp(np.log(m_t), np.log(m), np.log(adev))))
+
+
+def plot_allan(curves, t_cycle, title="Девиация Аллана g"):
+    """
+    curves: список (подпись, (m, adev, err), S [мкГал/sqrt(цикл)], цвет, маркер).
+    Пунктир -- белый шум S/sqrt(m). Нижняя ось -- циклы, верхняя -- секунды.
+    """
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for lab, (m, adev, err), S, col, mk in curves:
+        ax.errorbar(m, adev, yerr=err, fmt=mk + "-", ms=4, lw=1, capsize=2, color=col,
+                    label=f"{lab}: {S:.3g} мкГал/√цикл ({S * np.sqrt(t_cycle):.3g} мкГал/√Гц)")
+        mm = np.array([m[0], m[-1]], dtype=float)
+        ax.plot(mm, S / np.sqrt(mm), ":", color=col, lw=1)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Число усредняемых циклов m")
+    ax.set_ylabel("Девиация Аллана g, мкГал")
+    sec = ax.secondary_xaxis("top", functions=(lambda m: m * t_cycle, lambda s: s / t_cycle))
+    sec.set_xlabel("τ, с")
+    ax.grid(alpha=0.3, which="both")
+    ax.legend(fontsize=9)
+    ax.set_title(title)
+    fig.tight_layout()
+
+
+def kz_segments(alp, y, Fz, t, init, prm, g_sign, n_seg,
+                bounds=(-6.5e-3, -4.0e-3), h=5e-5, verbose=True):
+    """
+    Kz по n_seg сегментам при ФИКСИРОВАННЫХ sigma и q (init), без PSO.
+    sd сегмента -- из кривизны J(Kz): var = 2 / (cnt * J''), т.к. -2lnL = cnt*J.
+    Тесты: (1) χ² на постоянство Kz; (2) тренд (взвешенная линейная регрессия);
+    (3) χ² по разностям СОСЕДНИХ сегментов -- калибровка реальной погрешности.
+    """
+    edges = np.linspace(0, len(alp), n_seg + 1).astype(int)
+    ks, sds, th = [], [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        def f(k, a=a, b=b):
+            try:
+                return final_kalman_run(alp[a:b], y[a:b], Fz[a:b],
+                                        dict(init, Kz=k), prm, g_sign)["J"]
+            except Exception:
+                return BIG_OBJ
+        k0 = float(minimize_scalar(f, bounds=bounds, method="bounded",
+                                   options=dict(xatol=1e-8)).x)
+        d2 = (f(k0 + h) - 2 * f(k0) + f(k0 - h)) / h ** 2
+        cnt = (b - a) - prm.poi - prm.warmup
+        ks.append(k0)
+        sds.append(np.sqrt(2.0 / (cnt * d2)) if d2 > 0 else np.nan)
+        th.append(float(np.mean(t[a:b])) / 3600.0)
+    ks, sds, th = np.array(ks), np.array(sds), np.array(th)
+    ok = np.isfinite(sds)
+    ks, sds, th = ks[ok], sds[ok], th[ok]
+    n = len(ks)
+    dof = n - 1
+
+    # (1) постоянство
+    w = 1.0 / sds ** 2
+    kbar = float(np.sum(w * ks) / np.sum(w))
+    chi_c = float(np.sum(w * (ks - kbar) ** 2))
+    # (2) тренд
+    pc, cov = np.polyfit(th, ks, 1, w=1.0 / sds, cov="unscaled")
+    chi_l = float(np.sum(((ks - np.polyval(pc, th)) / sds) ** 2))
+    d_chi = chi_c - chi_l
+    slope, slope_sd = pc[0], float(np.sqrt(cov[0, 0]))
+    # (3) соседние сегменты
+    dif = np.diff(ks)
+    chi_a = float(np.sum(dif ** 2 / (sds[:-1] ** 2 + sds[1:] ** 2)))
+
+    if verbose:
+        print(f"\n--- Kz по {n} сегментам (≈{(edges[1] - edges[0])} циклов, "
+              f"sigma и q фиксированы) ---")
+        print("  t, ч :  " + " ".join(f"{v:9.2f}" for v in th))
+        print("  Kz   :  " + " ".join(f"{v * 1e3:9.4f}" for v in ks) + "   (×1e-3)")
+        print(f"  формальная sd сегмента: {sds.mean():.2e};  std(Kz сегментов) = {ks.std(ddof=1):.2e}")
+        print(f"  (1) постоянство : χ² = {chi_c:.1f}, ст. своб. {dof}, χ²/dof = {chi_c / dof:.2f}, "
+              f"p = {chi2_dist.sf(chi_c, dof):.3g}")
+        print(f"  (2) тренд       : {slope * 1e6:+.2f} ± {slope_sd * 1e6:.2f} (×1e-6 /ч) "
+              f"({slope / slope_sd:+.1f}σ); Δχ² = {d_chi:.1f} при 1 ст. своб. "
+              f"(p = {chi2_dist.sf(max(d_chi, 0), 1):.3g}); "
+              f"размах по записи {slope * (th[-1] - th[0]) * 1e5:+.1f}e-5")
+        print(f"  (3) соседние    : χ²/dof = {chi_a / dof:.2f}  "
+              f"-> реальная sd ≈ формальная × {np.sqrt(chi_a / dof):.2f}")
+        print(f"  после поправки на (3): χ²(постоянство)/dof = "
+              f"{chi_c / dof / (chi_a / dof):.2f}")
+    return {"t_h": th, "Kz": ks, "sd": sds, "chi_const": chi_c, "dof": dof,
+            "chi_adj": chi_a, "slope": slope, "slope_sd": slope_sd}
+
+
 # =====================================================================
 # main
 # =====================================================================
@@ -2416,6 +2511,10 @@ def main():
     print(f"\nEKF, Kz фиксирован = {Kz0:.4e}: J={fin3['J']:.5f}, "
           f"std(nu)={fin3['nu_std']:.3f}, LBp={fin3['lb_p']:.3f}")
 
+        
+    for n_seg in (7, 14, 25):
+        kz_segments(alp, y, Fz, t_all, init, prm, g_sign, n_seg)
+
     # ================= шаг 3: EKF с Kz в состоянии =================
     print(f"\n{'=' * 72}\nШаг 3: фильтр Калмана с Kz в состоянии (весь ряд, {n} циклов)\n{'=' * 72}")
     x0, P0 = kz_filter_start(alp, y, Fz, Kz0, prm, KZ_SIGMA0)
@@ -2446,6 +2545,7 @@ def main():
           f"std {kz_t.std():.2e}, min {kz_t.min():.4e}, max {kz_t.max():.4e}; "
           f"средняя sd фильтра {fin4['sd_Kz'].mean():.2e}")
     
+
     fin4s = None
     if DO_KZ_SMOOTH:
         fin4s = kz_filter_smooth(alp, y, Fz, x0, P0, qd, init["sigma_A"],
@@ -2455,6 +2555,30 @@ def main():
               f"std={fin4s['Kz'].std():.2e}; средняя sd {fin4s['sd_Kz'].mean():.2e} "
               f"(прямой: {fin4['sd_Kz'].mean():.2e}); "
               f"std(сглаж. − прямой) = {d.std():.2e}")
+
+    # ================= эффект кусочного Kz на g =================
+    n_seg_g = 14
+    seg = kz_segments(alp, y, Fz, t_all, init, prm, g_sign, n_seg_g, verbose=False)
+    if len(seg["Kz"]) == n_seg_g:
+        edges = np.linspace(0, n, n_seg_g + 1).astype(int)
+        kz_pw = np.repeat(seg["Kz"], np.diff(edges))           # длина n
+        fin_pw = final_kalman_run(alp, y, Fz, dict(init, Kz=kz_pw), prm, g_sign)
+        fin_gl = final_kalman_run(alp, y, Fz, dict(init, Kz=Kz_glob), prm, g_sign)
+        d = fin_pw["g_ugal"] - fin_gl["g_ugal"]                # индекс 0 <-> цикл i_first
+        i0 = fin_gl["i_first"]
+
+        db, gb = [], []
+        for a, b in zip(edges[:-1], edges[1:]):
+            a_, b_ = max(a, i0) - i0, b - i0
+            if b_ - a_ > 1000:
+                db.append(d[a_:b_].mean())
+                gb.append(fin_gl["g_ugal"][a_:b_].mean())
+        db, gb = np.array(db), np.array(gb)
+        noise_g = float(np.std(np.diff(gb)) / np.sqrt(2))      # шум средних по сегменту
+        print(f"\nΔg (кусочный Kz − глобальный Kz = {Kz_glob:.4e}), {len(db)} сегментов:")
+        print(f"  std = {db.std():.3g}, p2p = {np.ptp(db):.3g} мкГал; "
+              f"шум g в тех же сегментах ≈ {noise_g:.3g} мкГал; "
+              f"std(Δg)/шум = {db.std() / noise_g:.2f}")
 
     fin5 = None
     if DO_KZ_VEL:
@@ -2476,7 +2600,7 @@ def main():
     t_k = t_all[i_first + np.arange(len(kz_t))]
 
     # ================= фринж по npts точкам (без фильтра) =================
-    if FRINGE_KZ_MODE == "median":
+    if FRINGE_KZ_MODE == "init":
         kz_f = Kz0
     elif FRINGE_KZ_MODE == "median":
         kz_f = float(np.median(kz_t))
@@ -2491,6 +2615,29 @@ def main():
     print(f"std g: EKF (Kz фикс.) {g3.std():.3g}, EKF (Kz в состоянии) {g4.std():.3g} мкГал (по циклам); "
           f"фринж {gf.std():.3g} мкГал ({npts}-точечные группы)")
     kalman_report(fin3, fin4, fin4s, fin5, Fz, prm, t_k)
+
+    # ================= девиация Аллана: EKF (Kz = const) против фринджа =================
+    allan = None
+    if DO_ALLAN:
+        Kz_mean = float(np.mean(kz_t[1000:]))        # средний Kz по треку фильтра
+        fin_c = final_kalman_run(alp, y, Fz, dict(init, Kz=Kz_mean), prm, g_sign)
+        fr_c = fringe_npoint(alp, y, Fz, Kz_mean, T, npts, fin_c["i_first"], n, g_sign)
+
+        m_e, a_e, e_e = adev_in_cycles(fin_c["g_ugal"], 1)       # 1 отсчёт = 1 цикл
+        m_f, a_f, e_f = adev_in_cycles(fr_c["g_ugal"], npts)     # 1 отсчёт = npts циклов
+        S_e = white_noise_sensitivity(m_e, a_e, *ALLAN_FIT_M)
+        S_f = white_noise_sensitivity(m_f, a_f, *ALLAN_FIT_M)
+
+        print(f"\nДевиация Аллана, Kz = {Kz_mean:.4e} (среднее по треку фильтра)")
+        print(f"  чувствительность (m = {ALLAN_FIT_M[0]}..{ALLAN_FIT_M[1]}): "
+              f"EKF {S_e:.3g}, фринж {S_f:.3g} мкГал/√цикл "
+              f"({S_e * np.sqrt(t_cycle):.3g} и {S_f * np.sqrt(t_cycle):.3g} мкГал/√Гц)")
+        print("  m, циклов :   EKF, мкГал   фринж, мкГал   фринж/EKF")
+        for mt in (npts, 60, 600, 6000, 20000):
+            ae, af = _adev_interp(m_e, a_e, mt), _adev_interp(m_f, a_f, mt)
+            print(f"  {mt:9d} : {ae:11.3g} {af:14.3g} {af / ae:11.2f}")
+        allan = [("EKF (Kz = const)", (m_e, a_e, e_e), S_e, "tab:blue", "o"),
+                 (f"фринж по {npts} точкам", (m_f, a_f, e_f), S_f, "tab:red", "s")]
 
     # ================= Kz по блокам (прежний метод) =================
     res_blocks = None
@@ -2537,6 +2684,10 @@ def main():
         else:
             plot_kz_track(t_k, kz_t, fin4["sd_Kz"], Kz0, BRANCH, kz0_label,
                           kz_s=None if fin4s is None else fin4s["Kz"])
+        
+        if allan is not None:
+            plot_allan(allan, t_cycle, f"Девиация Аллана g, чирп {BRANCH}, Kz = const")
+        
         plt.show()
 
 if __name__ == "__main__":
