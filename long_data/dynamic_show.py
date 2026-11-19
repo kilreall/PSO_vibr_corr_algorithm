@@ -2181,7 +2181,7 @@ def plot_kz_compare(t_k, kz, sd, res_blocks, branch, kz0, t0, kz0_label,
     ax.legend(fontsize=8)
     fig.tight_layout()
 
-def estimate_lag(fwd, smo, max_lag=3000, step=10):
+def estimate_lag(fwd, smo, max_lag=20000, step=100):
     """
     Лаг прямого ряда относительно сглаженного (в циклах) по максимуму
     кросс-корреляции. Положительный лаг: прямой фильтр ЗАПАЗДЫВАЕТ.
@@ -2305,19 +2305,20 @@ def main():
     WIN_SIZE = 20
 
     # ---------------- Kz как состояние ----------------
-    KZ_SIGMA0 = 1e-3           # начальная std Kz (неопределённость Kz0)
+    KZ_SIGMA0 = 3e-4           # начальная std Kz (неопределённость Kz0)
     Q_KZ_MODE = "tune"         # "tune" -- q_Kz по NLL на всём ряду; "manual" -- из DKZ_MODEL
     DKZ_MODEL = 1e-6           # std шага Kz за цикл (для "manual")
     Q_KZ_LOG_BOUNDS = (-18.0, -9.0)   # границы log10 q_Kz для "tune"
-    DO_KZ_VEL = True                    # второй вариант фильтра: Kz + скорость dKz/цикл
+    DO_KZ_VEL = False                 # второй вариант фильтра: Kz + скорость dKz/цикл
     KZV_SIGMA0 = 1e-8                   # начальная std скорости, 1/цикл
     Q_KZV_LOG_BOUNDS = (-26.0, -14.0)   # границы log10 q_a (интенсивность «ускорения» Kz)
     # ---------------- Kz по блокам (прежний метод, для сравнения на графике) ----------------
     DO_BLOCKS = True           # False -- не считать блоки (график только с фильтром)
-    BLOCK_SIZE = 5000          # сбросов в блоке; остаток отбрасывается
+    BLOCK_SIZE = 9000          # сбросов в блоке; остаток отбрасывается
     MAX_BLOCKS = None          # None -- все блоки
     N_JOBS = None              # None -- все ядра
     DO_KZ_SMOOTH = True   
+    RECALIB_GLOBAL = True      # sigma и q по всему ряду (а не по первым N_INIT точкам)
 
     # ---------------- сравнение с фринджем ----------------
     DO_ALLAN = True
@@ -2374,6 +2375,42 @@ def main():
     print(f"  Kz0 = {Kz0:.4e} (источник: {KZ_INIT_SRC}); "
           f"Kz(EKF) = {init_res['Kz_kalman']:.4e}, Kz(окно) = {init_res['Kz_win']:.4e}")
 
+    # ================= глобальная перекалибровка R и q по всему ряду =================
+    if RECALIB_GLOBAL:
+        print(f"\n{'-' * 72}\nПерекалибровка sigma и q по всему ряду ({n} циклов), Kz = Kz0\n{'-' * 72}")
+        t0_rc = time.perf_counter()
+        J_rc, info_rc = tune_and_score(Fz, Kz0, alp, y, prm, tune_cfg, diagnostics=True)
+        if not info_rc:
+            raise RuntimeError("перекалибровка по всему ряду не сошлась")
+        q_old = init["q"].copy()
+        print(f"  sigma_A : {init['sigma_A']:.3e} -> {info_rc['sigma_A']:.3e}")
+        print(f"  sigma_ph: {init['sigma_ph']:.3e} -> {info_rc['sigma_ph']:.3e} "
+              f"({info_rc['dg_sigma_ph'] * UGAL:.3g} мкГал на сброс)")
+        lo_b, hi_b = tune_cfg.q_log_bounds
+        for nm, qo, qn in zip(Q_NAMES, q_old, info_rc["q"]):
+            print(f"  q_{nm:<2s}    : {qo:.3e} -> {qn:.3e}  "
+                  f"(log10 = {np.log10(qn):.2f}, границы [{lo_b:g}, {hi_b:g}])")
+        print(f"  J = {J_rc:.5f}, std(nu) = {info_rc['nu_stats']['std']:.3f}, "
+              f"LBp = {info_rc['nu_stats']['lb_pvalue']:.3f}, "
+              f"q у границы: {','.join(info_rc['q_at_bound']) or 'нет'}, "
+              f"{info_rc['n_it']} внешних итераций, {time.perf_counter() - t0_rc:.1f} с")
+        init["sigma_A"] = info_rc["sigma_A"]
+        init["sigma_ph"] = info_rc["sigma_ph"]
+        init["q"] = np.asarray(info_rc["q"], dtype=np.float64)
+
+        # стационарность: std(nu) по четвертям ряда при ФИКСИРОВАННЫХ параметрах
+        w_ = prm.warmup
+        a_c = compensate_alp(alp, Fz, Kz0, T)
+        x03, P03, _ = initial_fit(a_c[:prm.poi], y[:prm.poi], T)
+        r_ = run_ekf(np.ascontiguousarray(a_c[prm.poi:]), np.ascontiguousarray(y[prm.poi:]),
+                     x03, P03, init["q"], init["sigma_A"], init["sigma_ph"], T, w_)
+        S_ = r_["h"][w_:] + init["sigma_A"] ** 2 + r_["b"][w_:] * init["sigma_ph"] ** 2
+        nu_ = r_["e"][w_:] / np.sqrt(S_)
+        parts = np.array_split(nu_, 4)
+        print("  std(nu) по четвертям ряда: " + ", ".join(f"{p.std(ddof=1):.3f}" for p in parts)
+              + "  (≈1 везде -- параметры стационарны; тренд -- шум меняется)")
+
+
     # ================= шаг 2: EKF с ФИКСИРОВАННЫМ Kz0 (для сравнения) =================
     fin3 = final_kalman_run(alp, y, Fz, init, prm, g_sign)
     print(f"\nEKF, Kz фиксирован = {Kz0:.4e}: J={fin3['J']:.5f}, "
@@ -2399,6 +2436,11 @@ def main():
     fin4 = kz_filter_run(alp, y, Fz, x0, P0, qd, init["sigma_A"], init["sigma_ph"],
                          prm, g_sign)
     kz_t = fin4["Kz"]
+    Kz_glob = float(np.median(kz_t))
+    fin3g = final_kalman_run(alp, y, Fz, dict(init, Kz=Kz_glob), prm, g_sign)
+    print(f"\nEKF, Kz глобальный = {Kz_glob:.4e}: J={fin3g['J']:.5f}, "
+          f"std g {fin3g['g_ugal'].std():.3g} мкГал (Kz0: {fin3['g_ugal'].std():.3g}, "
+          f"Kz в состоянии: {fin4['g_ugal'].std():.3g})")
     print(f"  J={fin4['J']:.5f}, std(nu)={fin4['nu_std']:.3f}, LBp={fin4['lb_p']:.3f}")
     print(f"  Kz(t): начало {kz_t[0]:.4e}, конец {kz_t[-1]:.4e}, mean {kz_t.mean():.4e}, "
           f"std {kz_t.std():.2e}, min {kz_t.min():.4e}, max {kz_t.max():.4e}; "
@@ -2434,7 +2476,7 @@ def main():
     t_k = t_all[i_first + np.arange(len(kz_t))]
 
     # ================= фринж по npts точкам (без фильтра) =================
-    if FRINGE_KZ_MODE == "init":
+    if FRINGE_KZ_MODE == "median":
         kz_f = Kz0
     elif FRINGE_KZ_MODE == "median":
         kz_f = float(np.median(kz_t))
