@@ -1199,6 +1199,10 @@ def _jit_warmup():
                  np.array([0.1, 0.2]), np.array([0.1, 0.2]))
     _fisher_core(np.ones(n), np.zeros(n), np.ones(n), 0.1, 0.1,
                  1e-8, 1e-8, 1.0, 1.0, 2, 1e-4)
+    xf, xs = np.empty((n, 4)), np.empty((n, 4))
+    Pf, Ps = np.empty((n, 4, 4)), np.empty((n, 4, 4))
+    _ekf4_rts_core(a, np.zeros(n), np.zeros(n), np.array([0.5, 0.3, 0.0, 0.0]),
+                   1e-4 * np.eye(4), np.full(4, 1e-6), 1e-4, 1e-2, xf, Pf, xs, Ps)
 
 
 def _check_cfg(tcfg: TuneCfg):
@@ -1512,7 +1516,7 @@ def final_kalman_run(alp, y, Fz, best, prm, g_sign=1.0):
     S = r["h"][w:] + best["sigma_A"] ** 2 + r["b"][w:] * best["sigma_ph"] ** 2
     nu = innovation_stats(r["e"][w:] / np.sqrt(S), 20)
     return {"g_ugal": g_ugal, "ph": ph, "J": r["nll"] / r["cnt"],
-            "nu_std": nu["std"], "lb_p": nu["lb_pvalue"], "i_first": poi + w}
+            "nu_std": nu["std"], "lb_p": nu["lb_pvalue"], "i_first": poi + w, "e_rms": float(np.sqrt(np.mean(r["e"][w:] ** 2))),}
 
 
 def fringe_npoint(alp, y, Fz, Kz, T, npts, i_first, i_stop, g_sign=1.0):
@@ -1822,10 +1826,301 @@ def kz_filter_run(alp, y, Fz, x0, P0, qd, sA, sph, prm, g_sign=1.0):
     return {"g_ugal": g_sign * (ph - ph.mean()) * g_per_rad(T) * UGAL,
             "ph": ph, "Kz": r["x"][w:, 3],
             "sd_Kz": np.sqrt(np.maximum(r["p"][w:, 1], 0.0)),
-            "J": J, "nu_std": nu["std"], "lb_p": nu["lb_pvalue"], "i_first": poi + w}
+            "J": J, "nu_std": nu["std"], "lb_p": nu["lb_pvalue"], "i_first": poi + w, "e_rms": float(np.sqrt(np.mean(r["e"][w:] ** 2))),}
+
+# =====================================================================
+# 18b. Обратный проход (RTS-сглаживатель) для фильтра с Kz
+# =====================================================================
+#
+# Прямой EKF использует только прошлые данные, поэтому оценки ph и Kz
+# запаздывают. Обратный проход Рауха-Тунга-Штрибеля (F = I):
+#   C_i   = P_i (P_i + Q)^-1
+#   x^s_i = x_i + C_i (x^s_{i+1} - x_i)
+#   P^s_i = P_i + C_i (P^s_{i+1} - (P_{i} + Q)) C_i^T
+# Якобианы берутся из прямого прогона (стандартное EKF-RTS приближение).
+
+@njit(cache=True)
+def _ekf4_rts_core(c, Fz, y, x0, P0, qd, sA2, sph2, xf, Pf, xs, Ps):
+    """
+    Прямой прогон EKF (4 состояния) с сохранением x_i, P_i (апостериорных),
+    затем обратный проход RTS.
+    Выход (на месте): xf (n,4), Pf (n,4,4) -- фильтр; xs, Ps -- сглаженные.
+    Возвращает True, False при сбое (S <= 0 или нечисловая невязка).
+    """
+    n = c.shape[0]
+    x = x0.copy()
+    P = P0.copy()
+    H = np.empty(4)
+    PHt = np.empty(4)
+    K = np.empty(4)
+
+    # ---------- прямой проход ----------
+    for i in range(n):
+        for j in range(4):
+            P[j, j] += qd[j]
+
+        Phi = c[i] - x[3] * Fz[i] - x[2]
+        cs = np.cos(Phi)
+        sn = np.sin(Phi)
+        e = y[i] - (x[0] - x[1] * cs)
+        H[0] = 1.0
+        H[1] = -cs
+        H[2] = -x[1] * sn
+        H[3] = H[2] * Fz[i]
+
+        hph = 0.0
+        for j in range(4):
+            acc = 0.0
+            for k in range(4):
+                acc += P[j, k] * H[k]
+            PHt[j] = acc
+            hph += H[j] * acc
+        S = hph + sA2 + x[1] * x[1] * sn * sn * sph2
+        if not (S > 0.0) or not np.isfinite(e):
+            return False
+
+        for j in range(4):
+            K[j] = PHt[j] / S
+            x[j] += K[j] * e
+        for j in range(4):
+            for k in range(4):
+                P[j, k] -= K[j] * K[k] * S
+        for j in range(4):
+            for k in range(j + 1, 4):
+                m = 0.5 * (P[j, k] + P[k, j])
+                P[j, k] = m
+                P[k, j] = m
+
+        for j in range(4):
+            xf[i, j] = x[j]
+            for k in range(4):
+                Pf[i, j, k] = P[j, k]
+
+    # ---------- обратный проход ----------
+    Pi = np.empty((4, 4))
+    Pm = np.empty((4, 4))
+    dP = np.empty((4, 4))
+    tmp = np.empty((4, 4))
+    dx = np.empty(4)
+    for j in range(4):
+        xs[n - 1, j] = xf[n - 1, j]
+        for k in range(4):
+            Ps[n - 1, j, k] = Pf[n - 1, j, k]
+
+    for i in range(n - 2, -1, -1):
+        for j in range(4):
+            for k in range(4):
+                Pi[j, k] = Pf[i, j, k]
+                Pm[j, k] = Pi[j, k]
+            Pm[j, j] += qd[j]                      # P^-_{i+1} = P_i + Q
+        Ct = np.linalg.solve(Pm, Pi)               # C^T = (P_i + Q)^-1 P_i
+        for j in range(4):
+            dx[j] = xs[i + 1, j] - xf[i, j]        # x^-_{i+1} = x_i
+            for k in range(4):
+                dP[j, k] = Ps[i + 1, j, k] - Pm[j, k]
+
+        for j in range(4):                         # x^s_i = x_i + C dx
+            acc = 0.0
+            for k in range(4):
+                acc += Ct[k, j] * dx[k]
+            xs[i, j] = xf[i, j] + acc
+
+        for j in range(4):                         # tmp = dP Ct
+            for k in range(4):
+                acc = 0.0
+                for m in range(4):
+                    acc += dP[j, m] * Ct[m, k]
+                tmp[j, k] = acc
+        for j in range(4):                         # P^s_i = P_i + Ct^T tmp
+            for k in range(4):
+                acc = 0.0
+                for m in range(4):
+                    acc += Ct[m, j] * tmp[m, k]
+                Ps[i, j, k] = Pi[j, k] + acc
+        for j in range(4):
+            for k in range(j + 1, 4):
+                m = 0.5 * (Ps[i, j, k] + Ps[i, k, j])
+                Ps[i, j, k] = m
+                Ps[i, k, j] = m
+    return True
 
 
-def plot_kz_track(t_s, kz, sd, kz0, branch, kz0_label):
+def kz_filter_smooth(alp, y, Fz, x0, P0, qd, sA, sph, prm, g_sign=1.0):
+    """
+    Фильтр с Kz + обратный проход (RTS). Параметры те же, что у kz_filter_run.
+    Ряды после warmup: g_ugal (из СГЛАЖЕННОЙ фазы, мкГал, без среднего),
+    Kz (сглаженный), sd_Kz (из P^s[3,3]), а также Kz_fwd -- прямой (несглаженный).
+    Сглаживание идёт по всему ряду (с начала данных EKF), warmup отрезается после.
+    """
+    T, poi, w = prm.T, prm.poi, prm.warmup
+    a = np.ascontiguousarray(alp[poi:], dtype=np.float64)
+    c = 2 * np.pi * T * T * a
+    F = np.ascontiguousarray(Fz[poi:], dtype=np.float64)
+    yy = np.ascontiguousarray(y[poi:], dtype=np.float64)
+    n = len(a)
+    xf, xs = np.empty((n, 4)), np.empty((n, 4))
+    Pf, Ps = np.empty((n, 4, 4)), np.empty((n, 4, 4))
+    ok = _ekf4_rts_core(c, F, yy, x0, P0, np.asarray(qd, dtype=np.float64),
+                        sA * sA, sph * sph, xf, Pf, xs, Ps)
+    if not ok:
+        raise RuntimeError("фильтр с Kz (сглаживатель) разошёлся")
+    ph = xs[w:, 2]
+    return {"g_ugal": g_sign * (ph - ph.mean()) * g_per_rad(T) * UGAL,
+            "ph": ph, "Kz": xs[w:, 3],
+            "sd_Kz": np.sqrt(np.maximum(Ps[w:, 3, 3], 0.0)),
+            "Kz_fwd": xf[w:, 3], "i_first": poi + w}
+
+
+# =====================================================================
+# 19. Фильтр с Kz и его скоростью: x = [A, B, ph, Kz, v],  v = dKz/цикл
+# =====================================================================
+
+@njit(cache=True)
+def _ekf5_core(c, Fz, y, x0, P0, Q, sA2, sph2, start,
+               e_out, h_out, b_out, x_out, p_out):
+    """
+    EKF с 5 состояниями. Предсказание: Kz += v, P = F P F^T + Q, F = I + e3 e4^T.
+    Измерение как в _ekf4_core (скорость в H не входит).
+    Выход: e_out, h_out, b_out; x_out (n,5); p_out (n,2) -- P[2,2] и P[3,3].
+    Возвращает (sum_{i>=start}[ln S + e^2/S], число точек); (inf, 0) при сбое.
+    """
+    n = c.shape[0]
+    x = x0.copy()
+    P = P0.copy()
+    H = np.zeros(5)
+    PHt = np.empty(5)
+    K = np.empty(5)
+    nll = 0.0
+    cnt = 0
+
+    for i in range(n):
+        x[3] += x[4]
+        for k in range(5):
+            P[3, k] += P[4, k]
+        for j in range(5):
+            P[j, 3] += P[j, 4]
+        for j in range(5):
+            for k in range(5):
+                P[j, k] += Q[j, k]
+
+        Phi = c[i] - x[3] * Fz[i] - x[2]
+        cs = np.cos(Phi)
+        sn = np.sin(Phi)
+        e = y[i] - (x[0] - x[1] * cs)
+        H[0] = 1.0
+        H[1] = -cs
+        H[2] = -x[1] * sn
+        H[3] = H[2] * Fz[i]
+
+        hph = 0.0
+        for j in range(5):
+            acc = 0.0
+            for k in range(5):
+                acc += P[j, k] * H[k]
+            PHt[j] = acc
+            hph += H[j] * acc
+        bsin2 = x[1] * x[1] * sn * sn
+        S = hph + sA2 + bsin2 * sph2
+        if not (S > 0.0) or not np.isfinite(e):
+            return np.inf, 0
+
+        for j in range(5):
+            K[j] = PHt[j] / S
+            x[j] += K[j] * e
+        for j in range(5):
+            for k in range(5):
+                P[j, k] -= K[j] * K[k] * S
+        for j in range(5):
+            for k in range(j + 1, 5):
+                m = 0.5 * (P[j, k] + P[k, j])
+                P[j, k] = m
+                P[k, j] = m
+
+        e_out[i] = e
+        h_out[i] = hph
+        b_out[i] = bsin2
+        for j in range(5):
+            x_out[i, j] = x[j]
+        p_out[i, 0] = P[2, 2]
+        p_out[i, 1] = P[3, 3]
+
+        if i >= start:
+            nll += np.log(S) + e * e / S
+            cnt += 1
+
+    return nll, cnt
+
+
+def kzv_Q(q3, q_a):
+    """
+    Q (5x5): диагональ q3 для [A, B, ph]; для (Kz, v) -- дискретный белый шум
+    ускорения Kz с интенсивностью q_a (интегрированное блуждание):
+    [[q_a/3, q_a/2], [q_a/2, q_a]].
+    """
+    Q = np.zeros((5, 5))
+    Q[0, 0], Q[1, 1], Q[2, 2] = q3
+    Q[3, 3] = q_a / 3.0
+    Q[3, 4] = Q[4, 3] = q_a / 2.0
+    Q[4, 4] = q_a
+    return Q
+
+
+def kzv_start(x0, P0, sigma_v0):
+    """Из начальных (x0 (4,), P0 (4,4)) фильтра с Kz: добавить скорость v = 0 со std sigma_v0."""
+    x5 = np.append(x0, 0.0)
+    P5 = np.zeros((5, 5))
+    P5[:4, :4] = P0
+    P5[4, 4] = sigma_v0 ** 2
+    return x5, P5
+
+
+def _kzv_J(alp, y, Fz, x0, P0, Q, sA, sph, prm):
+    """Средний NLL инноваций фильтра Kz + скорость; (inf, None) при сбое."""
+    a, yy, F = alp[prm.poi:], y[prm.poi:], Fz[prm.poi:]
+    n = len(a)
+    e, h, b = np.empty(n), np.empty(n), np.empty(n)
+    x = np.empty((n, 5))
+    p = np.empty((n, 2))
+    nll, cnt = _ekf5_core(2 * np.pi * prm.T ** 2 * np.asarray(a, dtype=np.float64),
+                          np.asarray(F, dtype=np.float64), np.asarray(yy, dtype=np.float64),
+                          x0, P0, Q, sA * sA, sph * sph, prm.warmup, e, h, b, x, p)
+    if not np.isfinite(nll) or cnt == 0:
+        return np.inf, None
+    return nll / cnt, {"e": e, "h": h, "b": b, "x": x, "p": p}
+
+
+def tune_q_kzv(alp, y, Fz, x0, P0, q3, sA, sph, prm, log_bounds, n_grid=13):
+    """Подбор q_a по NLL инноваций на всём ряду (сетка по log10 q_a + уточнение)."""
+    def J_of(lq):
+        J, _ = _kzv_J(alp, y, Fz, x0, P0, kzv_Q(q3, 10.0 ** lq), sA, sph, prm)
+        return J if np.isfinite(J) else BIG_OBJ
+
+    lqs = np.linspace(log_bounds[0], log_bounds[1], n_grid)
+    Js = np.array([J_of(l) for l in lqs])
+    i = int(np.argmin(Js))
+    lq_best, J_best = float(lqs[i]), float(Js[i])
+    r = minimize_scalar(J_of, bounds=(lqs[max(i - 1, 0)], lqs[min(i + 1, n_grid - 1)]),
+                        method="bounded", options=dict(xatol=0.02))
+    if r.fun < J_best:
+        lq_best, J_best = float(r.x), float(r.fun)
+    return lq_best, J_best, lqs, Js
+
+
+def kzv_filter_run(alp, y, Fz, x0, P0, q3, q_a, sA, sph, prm, g_sign=1.0):
+    """Итоговый прогон: ряды после warmup -- g_ugal, Kz(t), sd_Kz, J, диагностика."""
+    T, poi, w = prm.T, prm.poi, prm.warmup
+    J, r = _kzv_J(alp, y, Fz, x0, P0, kzv_Q(q3, q_a), sA, sph, prm)
+    if r is None:
+        raise RuntimeError("фильтр Kz + скорость разошёлся")
+    ph = r["x"][w:, 2]
+    S = r["h"][w:] + sA ** 2 + r["b"][w:] * sph ** 2
+    nu = innovation_stats(r["e"][w:] / np.sqrt(S), 20)
+    return {"g_ugal": g_sign * (ph - ph.mean()) * g_per_rad(T) * UGAL,
+            "ph": ph, "Kz": r["x"][w:, 3],
+            "sd_Kz": np.sqrt(np.maximum(r["p"][w:, 1], 0.0)),
+            "J": J, "nu_std": nu["std"], "lb_p": nu["lb_pvalue"], "i_first": poi + w, "e_rms": float(np.sqrt(np.mean(r["e"][w:] ** 2))),}
+
+def plot_kz_track(t_s, kz, sd, kz0, branch, kz0_label, kz_s=None):
     """Kz(t), найденный фильтром Калмана, с полосой ±1 sigma; Kz0 -- пунктиром."""
     import matplotlib.pyplot as plt
 
@@ -1835,6 +2130,9 @@ def plot_kz_track(t_s, kz, sd, kz0, branch, kz0_label):
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.fill_between(t, kz - sd, kz + sd, color=col, alpha=0.2, lw=0, label="±1σ (фильтр)")
     ax.plot(t, kz, "-", lw=1.0, color=col, label=f"Kz(t), фильтр Калмана, чирп {branch}")
+    if kz_s is not None:
+        ax.plot(t, kz_s, "-", lw=1.2, color="red", zorder=5,
+                label="Kz(t): фильтр + обратный проход (RTS)")
     ax.axhline(kz0, color="gray", ls="--", lw=1, label=kz0_label)
     ax.set_xlabel(f"Время, {unit}")
     ax.set_ylabel("Kz")
@@ -1843,6 +2141,133 @@ def plot_kz_track(t_s, kz, sd, kz0, branch, kz0_label):
     ax.legend()
     fig.tight_layout()
 
+
+    
+
+def plot_kz_compare(t_k, kz, sd, res_blocks, branch, kz0, t0, kz0_label,
+                    kz_v=None, kz_s=None):
+    """
+    Kz(t): фильтр Калмана (линия, ±1σ), опционально фильтр со скоростью kz_v и
+    сглаженный (RTS) kz_s, Kz по блокам (EKF и оконный cos-fit), Kz0 (звезда в t0).
+    """
+    import matplotlib.pyplot as plt
+
+    tb_s = np.asarray(res_blocks["t_s"], dtype=float)
+    div, unit = _time_unit(max(float(t_k[-1]), float(np.nanmax(tb_s))))
+    col = BRANCH_COLORS[branch]
+    bs = res_blocks["block_size"]
+
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    ax.fill_between(t_k / div, kz - sd, kz + sd, color=col, alpha=0.2, lw=0,
+                    label="±1σ (фильтр)")
+    ax.plot(t_k / div, kz, "-", lw=1.0, color=col,
+            label=f"Kz(t): фильтр Калмана (Kz в состоянии), чирп {branch}")
+    if kz_v is not None:
+        ax.plot(t_k / div, kz_v, "-", lw=1.0, color="tab:purple",
+                label="Kz(t): фильтр Калмана (Kz + скорость dKz/dt)")
+    if kz_s is not None:
+        ax.plot(t_k / div, kz_s, "-", lw=1.2, color="red", zorder=5,
+                label="Kz(t): фильтр Калмана + обратный проход (RTS)")
+    tb = tb_s / div
+    ax.plot(tb, res_blocks["Kz_kalman"], "o-", ms=4, color="k",
+            label=f"по блокам ({bs} сбросов): EKF (NLL инноваций)")
+    ax.plot(tb, res_blocks["Kz_win"], "s--", ms=4, color="tab:green", alpha=0.7,
+            label="по блокам: оконный cos-fit")
+    ax.plot([t0 / div], [kz0], "*", ms=14, color="tab:orange", label=kz0_label)
+    ax.set_xlabel(f"Время, {unit}")
+    ax.set_ylabel("Kz")
+    ax.set_title(f"Kz: фильтр Калмана и подбор по блокам, чирп {branch}")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+
+def estimate_lag(fwd, smo, max_lag=3000, step=10):
+    """
+    Лаг прямого ряда относительно сглаженного (в циклах) по максимуму
+    кросс-корреляции. Положительный лаг: прямой фильтр ЗАПАЗДЫВАЕТ.
+    Возвращает (лаг, коэффициент корреляции в максимуме).
+    """
+    a = fwd - fwd.mean()
+    b = smo - smo.mean()
+    best_l, best_c = 0, -2.0
+    for L in range(-max_lag, max_lag + 1, step):
+        if L >= 0:
+            x, y_ = a[L:], b[:len(b) - L]
+        else:
+            x, y_ = a[:L], b[-L:]
+        c = float(x @ y_) / np.sqrt(float(x @ x) * float(y_ @ y_))
+        if c > best_c:
+            best_l, best_c = L, c
+    return best_l, best_c
+
+
+def kalman_report(fin3, fin4, fin4s, fin5, Fz, prm, t_k, win=1000, skip=1000):
+    """
+    Сводка «как отработал фильтр с Kz»:
+      1) качество описания данных (J, RMS инноваций, белизна инноваций);
+      2) значимость и форма Kz(t), запаздывание прямого фильтра;
+      3) эффект Kz(t) на g относительно Kz = const;
+      4) масштаб ошибки g от неопределённости Kz.
+    win -- размер окна усреднения для оценки эффекта на g; skip -- сколько
+    первых циклов исключить из статистик Kz (переходный процесс).
+    """
+    cnt = len(fin4["g_ugal"])
+    i0 = fin4["i_first"]
+    fz = np.asarray(Fz[i0:i0 + cnt], dtype=float)
+    dt = float((t_k[-1] - t_k[0]) / (len(t_k) - 1))
+    print(f"\n{'=' * 72}\nОтчёт по фильтру Калмана (циклов: {cnt}, шаг {dt:.3f} с)\n{'=' * 72}")
+
+    # --- 1) качество ---
+    print("1) Описание данных (чем меньше J и RMS(e), тем лучше; std(nu) ~ 1, LBp > 0.05):")
+    rows = [("Kz фиксирован   ", fin3), ("Kz в состоянии  ", fin4)]
+    if fin5 is not None:
+        rows.append(("Kz + скорость   ", fin5))
+    for name, f in rows:
+        print(f"   {name}: J={f['J']:.5f}  Δ(-2lnL) к фикс. = {cnt * (fin3['J'] - f['J']):+8.1f}  "
+              f"RMS(e)={f['e_rms']:.5f} ({f['e_rms'] / fin3['e_rms'] - 1:+.2%})  "
+              f"std(nu)={f['nu_std']:.3f}  LBp={f['lb_p']:.3f}")
+
+    # --- 2) Kz(t) ---
+    kz, sd = fin4["Kz"][skip:], fin4["sd_Kz"][skip:]
+    print(f"\n2) Kz(t) без первых {skip} циклов:")
+    print(f"   прямой:    mean={kz.mean():.4e}  std={kz.std():.2e}  "
+          f"p2p={np.ptp(kz):.2e}  средняя sd={sd.mean():.2e}")
+    if fin4s is not None:
+        ks, sds = fin4s["Kz"][skip:], fin4s["sd_Kz"][skip:]
+        snr = ks.std() / sds.mean()
+        print(f"   сглажен.:  mean={ks.mean():.4e}  std={ks.std():.2e}  "
+              f"p2p={np.ptp(ks):.2e}  средняя sd={sds.mean():.2e}")
+        print(f"   std(Kz сглаж.) / sd(Kz сглаж.) = {snr:.1f}  "
+              f"(≲1 -- дрейф на уровне шума оценки; ≫1 -- дрейф реален)")
+        lag, c = estimate_lag(fin4["Kz"][skip:], fin4s["Kz"][skip:])
+        print(f"   запаздывание прямого фильтра относительно сглаженного: {lag} циклов "
+              f"({lag * dt / 60:.1f} мин), корреляция {c:.3f}")
+
+    # --- 3) эффект на g ---
+    m = cnt // win
+    gb3 = fin3["g_ugal"][:m * win].reshape(m, win).mean(axis=1)
+    noise = float(np.std(np.diff(gb3)) / np.sqrt(2))   # шум средних по окну (без приливов)
+    print(f"\n3) Эффект Kz(t) на g относительно Kz = const (окно {win} циклов, "
+          f"шум средних по окну ~ {noise:.2f} мкГал):")
+    th = np.asarray(t_k, dtype=float) / 3600.0
+    variants = [("Kz в состоянии ", fin4)]
+    if fin4s is not None:
+        variants.append(("Kz + RTS        ", fin4s))
+    if fin5 is not None:
+        variants.append(("Kz + скорость  ", fin5))
+    for name, f in variants:
+        d = f["g_ugal"] - fin3["g_ugal"]
+        db = d[:m * win].reshape(m, win).mean(axis=1)
+        slope = np.polyfit(th, d, 1)[0]
+        print(f"   {name}: std(Δg по циклам)={d.std():.3g}  std(Δg по окнам)={db.std():.3g}  "
+              f"p2p(окна)={np.ptp(db):.3g} мкГал; тренд {slope:+.3g} мкГал/ч; "
+              f"std(окна)/шум = {db.std() / noise:.1f}")
+
+    # --- 4) масштаб ошибки от Kz ---
+    k = g_per_rad(prm.T) * UGAL
+    print(f"\n4) std(Fz) = {fz.std():.3g}, mean(Fz) = {fz.mean():.3g}; "
+          f"sd(Kz) {sd.mean():.1e} × std(Fz) ≈ {sd.mean() * fz.std() * k:.3g} мкГал "
+          f"(грубый масштаб по циклам; постоянный сдвиг Kz действует через mean(Fz))")
 
 def _adev_at(m, adev, m_target):
     """Значение девиации Аллана в узле, ближайшем к m_target циклов."""
@@ -1884,6 +2309,15 @@ def main():
     Q_KZ_MODE = "tune"         # "tune" -- q_Kz по NLL на всём ряду; "manual" -- из DKZ_MODEL
     DKZ_MODEL = 1e-6           # std шага Kz за цикл (для "manual")
     Q_KZ_LOG_BOUNDS = (-18.0, -9.0)   # границы log10 q_Kz для "tune"
+    DO_KZ_VEL = True                    # второй вариант фильтра: Kz + скорость dKz/цикл
+    KZV_SIGMA0 = 1e-8                   # начальная std скорости, 1/цикл
+    Q_KZV_LOG_BOUNDS = (-26.0, -14.0)   # границы log10 q_a (интенсивность «ускорения» Kz)
+    # ---------------- Kz по блокам (прежний метод, для сравнения на графике) ----------------
+    DO_BLOCKS = True           # False -- не считать блоки (график только с фильтром)
+    BLOCK_SIZE = 5000          # сбросов в блоке; остаток отбрасывается
+    MAX_BLOCKS = None          # None -- все блоки
+    N_JOBS = None              # None -- все ядра
+    DO_KZ_SMOOTH = True   
 
     # ---------------- сравнение с фринджем ----------------
     DO_ALLAN = True
@@ -1969,6 +2403,32 @@ def main():
     print(f"  Kz(t): начало {kz_t[0]:.4e}, конец {kz_t[-1]:.4e}, mean {kz_t.mean():.4e}, "
           f"std {kz_t.std():.2e}, min {kz_t.min():.4e}, max {kz_t.max():.4e}; "
           f"средняя sd фильтра {fin4['sd_Kz'].mean():.2e}")
+    
+    fin4s = None
+    if DO_KZ_SMOOTH:
+        fin4s = kz_filter_smooth(alp, y, Fz, x0, P0, qd, init["sigma_A"],
+                                 init["sigma_ph"], prm, g_sign)
+        d = fin4s["Kz"] - fin4s["Kz_fwd"]
+        print(f"\n  Обратный проход (RTS): Kz сглаж. mean={fin4s['Kz'].mean():.4e}, "
+              f"std={fin4s['Kz'].std():.2e}; средняя sd {fin4s['sd_Kz'].mean():.2e} "
+              f"(прямой: {fin4['sd_Kz'].mean():.2e}); "
+              f"std(сглаж. − прямой) = {d.std():.2e}")
+
+    fin5 = None
+    if DO_KZ_VEL:
+        x0v, P0v = kzv_start(x0, P0, KZV_SIGMA0)
+        lqv, Jv, lqsv, Jsv = tune_q_kzv(alp, y, Fz, x0v, P0v, init["q"],
+                                        init["sigma_A"], init["sigma_ph"], prm,
+                                        Q_KZV_LOG_BOUNDS)
+        fin5 = kzv_filter_run(alp, y, Fz, x0v, P0v, init["q"], 10.0 ** lqv,
+                              init["sigma_A"], init["sigma_ph"], prm, g_sign)
+        cnt = n - prm.poi - prm.warmup
+        print(f"\n  Kz + скорость: log10 q_a = {lqv:.2f}, J = {fin5['J']:.5f}, "
+              f"std(nu)={fin5['nu_std']:.3f}; "
+              f"Δ(-2lnL) относительно фильтра без скорости = {cnt * (fin4['J'] - fin5['J']):+.1f} "
+              f"(скорость оправдана, если заметно больше ~5)")
+        if min(lqv - Q_KZV_LOG_BOUNDS[0], Q_KZV_LOG_BOUNDS[1] - lqv) < 0.1:
+            print("  ВНИМАНИЕ: log10 q_a у границы Q_KZV_LOG_BOUNDS")
 
     i_first = fin4["i_first"]
     t_k = t_all[i_first + np.arange(len(kz_t))]
@@ -1988,30 +2448,54 @@ def main():
     g3, g4, gf = fin3["g_ugal"], fin4["g_ugal"], fr["g_ugal"]
     print(f"std g: EKF (Kz фикс.) {g3.std():.3g}, EKF (Kz в состоянии) {g4.std():.3g} мкГал (по циклам); "
           f"фринж {gf.std():.3g} мкГал ({npts}-точечные группы)")
+    kalman_report(fin3, fin4, fin4s, fin5, Fz, prm, t_k)
 
-    # ================= девиация Аллана: только числа =================
-    if DO_ALLAN:
-        print()
-        for g, cps, name in ((g3, 1, "EKF, Kz фиксирован"),
-                             (g4, 1, "EKF, Kz в состоянии"),
-                             (gf, npts, f"фринж {npts} т.")):
-            m, adev, err = adev_in_cycles(g, cps)
-            sens = white_noise_sensitivity(m, adev, *ALLAN_FIT_M)
-            m1, a1 = _adev_at(m, adev, 1000)
-            print(f"Аллан [{name}]: S = {sens:.3g} мкГал/√цикл "
-                  f"(≈ {sens * np.sqrt(t_cycle):.3g} мкГал/√Гц); "
-                  f"ADEV({m1} ц.) = {a1:.3g}, ADEV({m[-1]} ц.) = {adev[-1]:.3g} мкГал")
+    # ================= Kz по блокам (прежний метод) =================
+    res_blocks = None
+    if DO_BLOCKS:
+        print(f"\n{'=' * 72}\nKz по блокам ({BLOCK_SIZE} сбросов), чирп {BRANCH}\n{'=' * 72}")
+        res_blocks = run_kz_dynamics(
+            alp, y, Fz, T=T, Kz_bounds=KZ_BOUNDS,
+            block_size=BLOCK_SIZE, max_blocks=MAX_BLOCKS,
+            t_cycle=t_cycle, t_axis=t_all,
+            dA_model=DA_MODEL, dB_model=DB_MODEL, dph_model=DPH_MODEL,
+            poi=POI, warmup=WARMUP, win_size=WIN_SIZE,
+            tune_cfg=tune_cfg,
+            n_particles=N_PARTICLES, n_iter=N_ITER, pso_xtol=PSO_XTOL,
+            n_jobs=N_JOBS, seed=SEED, tag=f"[{BRANCH}] ")
+        print_summary(res_blocks, f"(чирп {BRANCH}) ")
 
-    # ================= график: Kz(t) из фильтра =================
+        # Kz фильтра, усреднённый по тем же блокам, против Kz блока
+        filters = [("без скорости", kz_t)]
+        if fin5 is not None:
+            filters.append(("со скоростью", fin5["Kz"]))
+        for flab, kzs in filters:
+            kz_f_blk = np.full(len(res_blocks["Kz_kalman"]), np.nan)
+            for k, (i0, i1) in enumerate(zip(res_blocks["i_start"], res_blocks["i_stop"])):
+                lo = max(int(i0), i_first)
+                if i1 > lo:
+                    kz_f_blk[k] = kzs[lo - i_first:int(i1) - i_first].mean()
+            for name, key in (("EKF", "Kz_kalman"), ("окно", "Kz_win")):
+                d = kz_f_blk - res_blocks[key]
+                d = d[np.isfinite(d)]
+                if d.size > 1:
+                    print(f"  Kz фильтра {flab} (среднее по блоку) − Kz блока [{name}]: "
+                          f"mean={d.mean():+.2e}, std={d.std(ddof=1):.2e}")
+
+
+    # ================= график: Kz(t) =================
     if SHOW_PLOT:
         import matplotlib.pyplot as plt
-        plot_kz_track(t_k, kz_t, fin4["sd_Kz"], Kz0, BRANCH,
-                      f"Kz0 по первым {N_INIT} точкам = {Kz0:.4e}")
+        kz0_label = f"Kz0 по первым {N_INIT} точкам = {Kz0:.4e}"
+        if res_blocks is not None:
+            plot_kz_compare(t_k, kz_t, fin4["sd_Kz"], res_blocks, BRANCH, Kz0,
+                            float(np.mean(t_all[:N_INIT])), kz0_label,
+                            kz_v=None if fin5 is None else fin5["Kz"],
+                            kz_s=None if fin4s is None else fin4s["Kz"])
+        else:
+            plot_kz_track(t_k, kz_t, fin4["sd_Kz"], Kz0, BRANCH, kz0_label,
+                          kz_s=None if fin4s is None else fin4s["Kz"])
         plt.show()
-
-
-if __name__ == "__main__":   # если такой блок у вас уже есть в конце файла, не дублируйте
-    main()
 
 if __name__ == "__main__":
     main()
