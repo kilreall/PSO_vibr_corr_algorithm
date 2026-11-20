@@ -79,12 +79,9 @@ from typing import Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 
-try:
-    from main.gen_waveform import simul_wavefrom, plot_waveform, fa, keff
-    from main.gen_waveform import N_RP as GEN_N_RP
-except ImportError:                      # gen_waveform.py лежит рядом со скриптом
-    from gen_waveform import simul_wavefrom, plot_waveform, fa, keff
-    from gen_waveform import N_RP as GEN_N_RP
+# gen_waveform.py лежит рядом со скриптом
+from gen_waveform import simul_wavefrom, plot_waveform, fa, keff
+from gen_waveform import N_RP as GEN_N_RP
 
 # =====================================================================
 # 1. КОНСТАНТЫ

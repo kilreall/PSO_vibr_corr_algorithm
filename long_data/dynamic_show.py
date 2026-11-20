@@ -72,7 +72,7 @@ import numpy as np
 from numba import njit
 from scipy.optimize import minimize, minimize_scalar, nnls
 from scipy.stats import chi2 as chi2_dist
-
+from dataclasses import replace
 
 # =====================================================================
 # 1. Константы
@@ -2369,6 +2369,48 @@ def kz_segments(alp, y, Fz, t, init, prm, g_sign, n_seg,
             "chi_adj": chi_a, "slope": slope, "slope_sd": slope_sd}
 
 
+def q_ph_profile(alp, y, Fz, Kz, init, prm, tune_cfg, lq_grid):
+    """Профиль правдоподобия по log10 q_ph: σ_A, σ_ph, q_A, q_B переоцениваются при каждом q_ph."""
+    tcfg = replace(tune_cfg, q_free=(True, True, False))     # q_ph фиксирован
+    cnt = len(alp) - prm.poi - prm.warmup
+    Js, sph = [], []
+    for lq in lq_grid:
+        prm_q = replace(prm, q_init=np.array([init["q"][0], init["q"][1], 10.0 ** lq]))
+        J, info = tune_and_score(Fz, Kz, alp, y, prm_q, tcfg)
+        Js.append(J if info else np.nan)
+        sph.append(info["sigma_ph"] if info else np.nan)
+    Js, sph = np.array(Js), np.array(sph)
+    d = cnt * (Js - np.nanmin(Js))                           # Δ(-2lnL) к минимуму
+    print(f"\nПрофиль по q_ph (циклов в сумме: {cnt}):")
+    print("  log10 q_ph   мкГал/шаг   Δ(-2lnL)   sigma_ph")
+    for lq, dd, s in zip(lq_grid, d, sph):
+        print(f"  {lq:9.2f}  {np.sqrt(10 ** lq) * g_per_rad(prm.T) * UGAL:9.2f}  "
+              f"{dd:9.1f}  {s:9.3e}")
+    ok = np.isfinite(d) & (d <= 3.84)
+    if ok.any():
+        print(f"  95%-интервал (Δ<3.84): log10 q_ph от {lq_grid[ok].min():.2f} "
+              f"до {lq_grid[ok].max():.2f}")
+    m = np.isfinite(d) & (d < 15)
+    if m.sum() >= 3:
+        a2, a1, _ = np.polyfit(lq_grid[m], d[m], 2)
+        if a2 > 0:
+            print(f"  минимум log10 q_ph ≈ {-a1 / (2 * a2):.2f}, 1σ ≈ ±{1 / np.sqrt(a2):.2f} дек. (формально)")
+    return d
+
+
+def q_ph_by_parts(alp, y, Fz, Kz, prm, tune_cfg, n_parts=4):
+    """Свободный подбор q_ph (и остальных) отдельно по частям ряда -- реальный разброс."""
+    edges = np.linspace(0, len(alp), n_parts + 1).astype(int)
+    print(f"\nq_ph по {n_parts} частям ряда:")
+    for k, (a, b) in enumerate(zip(edges[:-1], edges[1:]), 1):
+        J, info = tune_and_score(Fz[a:b], Kz, alp[a:b], y[a:b], prm, tune_cfg, diagnostics=True)
+        if not info:
+            print(f"  часть {k}: не сошлась")
+            continue
+        print(f"  часть {k}: log10 q_ph = {np.log10(info['q'][2]):6.2f}, "
+              f"sigma_ph = {info['sigma_ph']:.3e}, sigma_A = {info['sigma_A']:.3e}")
+
+
 # =====================================================================
 # main
 # =====================================================================
@@ -2383,6 +2425,15 @@ def main():
     G_SIGN = {"+": +1.0, "-": -1.0}   # только направление оси g
 
     T = 12e-3                  # длительность плеча, с
+
+    # ---------------- что считать ----------------
+    DO_KZ_DYNAMICS = False     # ГЛАВНЫЙ выключатель всего, что связано с динамикой Kz(t).
+                               # False -> флаги DO_KZ_SEGMENTS/SMOOTH/VEL/BLOCKS ниже игнорируются
+    DO_KZ_SEGMENTS = True      # Kz по сегментам (7/14/25) и эффект кусочного Kz на g
+    DO_KZ_SMOOTH = True        # обратный проход RTS
+    DO_KZ_VEL = False          # фильтр Kz + скорость dKz/цикл
+    DO_BLOCKS = True           # Kz по блокам (PSO) для сравнения
+    DO_ALLAN = True
 
     # ---------------- начальный Kz: по первым N_INIT точкам (один блок) ----------------
     N_INIT = 1000
@@ -2399,28 +2450,24 @@ def main():
     WARMUP = 200               # инноваций, не входящих в fitness и в ряды g, Kz
     WIN_SIZE = 20
 
-    # ---------------- Kz как состояние ----------------
-    KZ_SIGMA0 = 3e-4           # начальная std Kz (неопределённость Kz0)
-    Q_KZ_MODE = "tune"         # "tune" -- q_Kz по NLL на всём ряду; "manual" -- из DKZ_MODEL
-    DKZ_MODEL = 1e-6           # std шага Kz за цикл (для "manual")
-    Q_KZ_LOG_BOUNDS = (-18.0, -9.0)   # границы log10 q_Kz для "tune"
-    DO_KZ_VEL = False                 # второй вариант фильтра: Kz + скорость dKz/цикл
-    KZV_SIGMA0 = 1e-8                   # начальная std скорости, 1/цикл
-    Q_KZV_LOG_BOUNDS = (-26.0, -14.0)   # границы log10 q_a (интенсивность «ускорения» Kz)
-    # ---------------- Kz по блокам (прежний метод, для сравнения на графике) ----------------
-    DO_BLOCKS = True           # False -- не считать блоки (график только с фильтром)
-    BLOCK_SIZE = 9000          # сбросов в блоке; остаток отбрасывается
-    MAX_BLOCKS = None          # None -- все блоки
-    N_JOBS = None              # None -- все ядра
-    DO_KZ_SMOOTH = True   
+    # ---------------- Kz как состояние (только при DO_KZ_DYNAMICS) ----------------
+    KZ_SIGMA0 = 3e-4
+    Q_KZ_MODE = "tune"         # "tune" | "manual"
+    DKZ_MODEL = 1e-6
+    Q_KZ_LOG_BOUNDS = (-18.0, -9.0)
+    KZV_SIGMA0 = 1e-8
+    Q_KZV_LOG_BOUNDS = (-26.0, -14.0)
+    BLOCK_SIZE = 9000
+    MAX_BLOCKS = None
+    N_JOBS = None
     RECALIB_GLOBAL = True      # sigma и q по всему ряду (а не по первым N_INIT точкам)
+    Q_PH_MANUAL = 1e-5
 
-    # ---------------- сравнение с фринджем ----------------
-    DO_ALLAN = True
+    # ---------------- сравнение с фринджем / Аллан ----------------
     FRINGE_NPTS = 6
-    FRINGE_KZ_MODE = "init"    # Kz для фринджа и для EKF без Kz в состоянии:
-                               #   "init" -- Kz0; "median" -- медиана Kz(t) фильтра;
-                               #   "track" -- Kz(t) фильтра по циклам (только для фринджа)
+    FRINGE_KZ_MODE = "init"    # "init" -- Kz0; "median" / "track" требуют DO_KZ_DYNAMICS
+    ALLAN_KZ_SRC = "init"      # Kz для Аллана: "init" -- Kz0;
+                               # "track_mean" -- среднее по треку фильтра (требует DO_KZ_DYNAMICS)
     ALLAN_FIT_M = (6, 60)
 
     if BRANCH not in ("+", "-"):
@@ -2431,6 +2478,17 @@ def main():
         raise ValueError(f"Q_KZ_MODE: 'tune' | 'manual', получено {Q_KZ_MODE!r}")
     if FRINGE_KZ_MODE not in ("init", "median", "track"):
         raise ValueError(f"FRINGE_KZ_MODE: 'init' | 'median' | 'track', получено {FRINGE_KZ_MODE!r}")
+    if ALLAN_KZ_SRC not in ("init", "track_mean"):
+        raise ValueError(f"ALLAN_KZ_SRC: 'init' | 'track_mean', получено {ALLAN_KZ_SRC!r}")
+
+    if not DO_KZ_DYNAMICS:
+        DO_KZ_SEGMENTS = DO_KZ_SMOOTH = DO_KZ_VEL = DO_BLOCKS = False
+        if FRINGE_KZ_MODE != "init":
+            print(f"[DO_KZ_DYNAMICS=False] FRINGE_KZ_MODE={FRINGE_KZ_MODE!r} -> 'init'")
+            FRINGE_KZ_MODE = "init"
+        if ALLAN_KZ_SRC != "init":
+            print(f"[DO_KZ_DYNAMICS=False] ALLAN_KZ_SRC={ALLAN_KZ_SRC!r} -> 'init'")
+            ALLAN_KZ_SRC = "init"
 
     tune_cfg = TuneCfg(sigma_init_mode="bins",
                        tune_mode="alternate",
@@ -2506,98 +2564,107 @@ def main():
               + "  (≈1 везде -- параметры стационарны; тренд -- шум меняется)")
 
 
-    # ================= шаг 2: EKF с ФИКСИРОВАННЫМ Kz0 (для сравнения) =================
+
+    if Q_PH_MANUAL is not None:
+        print(f"\nq_ph задан вручную: {init['q'][2]:.3e} -> {Q_PH_MANUAL:.3e}")
+        init["q"][2] = Q_PH_MANUAL
+
+    q_ph_profile(alp, y, Fz, Kz0, init, prm, tune_cfg, np.arange(-10.0, -5.9, 0.25))
+    q_ph_by_parts(alp, y, Fz, Kz0, prm, tune_cfg)
+
+    # ================= шаг 2: EKF с ФИКСИРОВАННЫМ Kz0 =================
     fin3 = final_kalman_run(alp, y, Fz, init, prm, g_sign)
+    i_first = fin3["i_first"]          # == poi + warmup, общий старт для всех рядов
     print(f"\nEKF, Kz фиксирован = {Kz0:.4e}: J={fin3['J']:.5f}, "
           f"std(nu)={fin3['nu_std']:.3f}, LBp={fin3['lb_p']:.3f}")
 
-        
-    for n_seg in (7, 14, 25):
-        kz_segments(alp, y, Fz, t_all, init, prm, g_sign, n_seg)
+    if DO_KZ_SEGMENTS:
+        for n_seg in (7, 14, 25):
+            kz_segments(alp, y, Fz, t_all, init, prm, g_sign, n_seg)
 
-    # ================= шаг 3: EKF с Kz в состоянии =================
-    print(f"\n{'=' * 72}\nШаг 3: фильтр Калмана с Kz в состоянии (весь ряд, {n} циклов)\n{'=' * 72}")
-    x0, P0 = kz_filter_start(alp, y, Fz, Kz0, prm, KZ_SIGMA0)
-    if Q_KZ_MODE == "tune":
-        lq, J_best, lqs, Js = tune_q_kz(alp, y, Fz, x0, P0, init["q"],
-                                        init["sigma_A"], init["sigma_ph"], prm,
-                                        Q_KZ_LOG_BOUNDS)
-        cnt = n - prm.poi - prm.warmup
-        print(f"  q_Kz подобран: log10 q_Kz = {lq:.2f} (std шага {10 ** (lq / 2):.2e} за цикл), "
-              f"J = {J_best:.5f}")
-        print(f"  Kz почти постоянен (q_Kz на нижней границе): J = {Js[0]:.5f}; "
-              f"выигрыш от дрейфа Δ(-2lnL) = {cnt * (Js[0] - J_best):.1f} "
-              f"(≳10 -- дрейф Kz значим)")
-    else:
-        lq = 2 * np.log10(DKZ_MODEL)
-        print(f"  q_Kz задан: std шага {DKZ_MODEL:.2e} за цикл")
-    qd = np.append(init["q"], 10.0 ** lq)
-    fin4 = kz_filter_run(alp, y, Fz, x0, P0, qd, init["sigma_A"], init["sigma_ph"],
-                         prm, g_sign)
-    kz_t = fin4["Kz"]
-    Kz_glob = float(np.median(kz_t))
-    fin3g = final_kalman_run(alp, y, Fz, dict(init, Kz=Kz_glob), prm, g_sign)
-    print(f"\nEKF, Kz глобальный = {Kz_glob:.4e}: J={fin3g['J']:.5f}, "
-          f"std g {fin3g['g_ugal'].std():.3g} мкГал (Kz0: {fin3['g_ugal'].std():.3g}, "
-          f"Kz в состоянии: {fin4['g_ugal'].std():.3g})")
-    print(f"  J={fin4['J']:.5f}, std(nu)={fin4['nu_std']:.3f}, LBp={fin4['lb_p']:.3f}")
-    print(f"  Kz(t): начало {kz_t[0]:.4e}, конец {kz_t[-1]:.4e}, mean {kz_t.mean():.4e}, "
-          f"std {kz_t.std():.2e}, min {kz_t.min():.4e}, max {kz_t.max():.4e}; "
-          f"средняя sd фильтра {fin4['sd_Kz'].mean():.2e}")
-    
+    # ================= шаг 3: Kz в состоянии фильтра (всё про динамику Kz) =================
+    fin4 = fin4s = fin5 = None
+    kz_t = t_k = None
+    Kz_glob = None
+    if DO_KZ_DYNAMICS:
+        print(f"\n{'=' * 72}\nШаг 3: фильтр Калмана с Kz в состоянии (весь ряд, {n} циклов)\n{'=' * 72}")
+        x0, P0 = kz_filter_start(alp, y, Fz, Kz0, prm, KZ_SIGMA0)
+        if Q_KZ_MODE == "tune":
+            lq, J_best, lqs, Js = tune_q_kz(alp, y, Fz, x0, P0, init["q"],
+                                            init["sigma_A"], init["sigma_ph"], prm,
+                                            Q_KZ_LOG_BOUNDS)
+            cnt = n - prm.poi - prm.warmup
+            print(f"  q_Kz подобран: log10 q_Kz = {lq:.2f} (std шага {10 ** (lq / 2):.2e} за цикл), "
+                  f"J = {J_best:.5f}")
+            print(f"  Kz почти постоянен (q_Kz на нижней границе): J = {Js[0]:.5f}; "
+                  f"выигрыш от дрейфа Δ(-2lnL) = {cnt * (Js[0] - J_best):.1f} "
+                  f"(≳10 -- дрейф Kz значим)")
+        else:
+            lq = 2 * np.log10(DKZ_MODEL)
+            print(f"  q_Kz задан: std шага {DKZ_MODEL:.2e} за цикл")
+        qd = np.append(init["q"], 10.0 ** lq)
+        fin4 = kz_filter_run(alp, y, Fz, x0, P0, qd, init["sigma_A"], init["sigma_ph"],
+                             prm, g_sign)
+        kz_t = fin4["Kz"]
+        Kz_glob = float(np.median(kz_t))
+        fin3g = final_kalman_run(alp, y, Fz, dict(init, Kz=Kz_glob), prm, g_sign)
+        print(f"\nEKF, Kz глобальный = {Kz_glob:.4e}: J={fin3g['J']:.5f}, "
+              f"std g {fin3g['g_ugal'].std():.3g} мкГал (Kz0: {fin3['g_ugal'].std():.3g}, "
+              f"Kz в состоянии: {fin4['g_ugal'].std():.3g})")
+        print(f"  J={fin4['J']:.5f}, std(nu)={fin4['nu_std']:.3f}, LBp={fin4['lb_p']:.3f}")
+        print(f"  Kz(t): начало {kz_t[0]:.4e}, конец {kz_t[-1]:.4e}, mean {kz_t.mean():.4e}, "
+              f"std {kz_t.std():.2e}, min {kz_t.min():.4e}, max {kz_t.max():.4e}; "
+              f"средняя sd фильтра {fin4['sd_Kz'].mean():.2e}")
 
-    fin4s = None
-    if DO_KZ_SMOOTH:
-        fin4s = kz_filter_smooth(alp, y, Fz, x0, P0, qd, init["sigma_A"],
-                                 init["sigma_ph"], prm, g_sign)
-        d = fin4s["Kz"] - fin4s["Kz_fwd"]
-        print(f"\n  Обратный проход (RTS): Kz сглаж. mean={fin4s['Kz'].mean():.4e}, "
-              f"std={fin4s['Kz'].std():.2e}; средняя sd {fin4s['sd_Kz'].mean():.2e} "
-              f"(прямой: {fin4['sd_Kz'].mean():.2e}); "
-              f"std(сглаж. − прямой) = {d.std():.2e}")
+        if DO_KZ_SMOOTH:
+            fin4s = kz_filter_smooth(alp, y, Fz, x0, P0, qd, init["sigma_A"],
+                                     init["sigma_ph"], prm, g_sign)
+            d = fin4s["Kz"] - fin4s["Kz_fwd"]
+            print(f"\n  Обратный проход (RTS): Kz сглаж. mean={fin4s['Kz'].mean():.4e}, "
+                  f"std={fin4s['Kz'].std():.2e}; средняя sd {fin4s['sd_Kz'].mean():.2e} "
+                  f"(прямой: {fin4['sd_Kz'].mean():.2e}); "
+                  f"std(сглаж. − прямой) = {d.std():.2e}")
 
-    # ================= эффект кусочного Kz на g =================
-    n_seg_g = 14
-    seg = kz_segments(alp, y, Fz, t_all, init, prm, g_sign, n_seg_g, verbose=False)
-    if len(seg["Kz"]) == n_seg_g:
-        edges = np.linspace(0, n, n_seg_g + 1).astype(int)
-        kz_pw = np.repeat(seg["Kz"], np.diff(edges))           # длина n
-        fin_pw = final_kalman_run(alp, y, Fz, dict(init, Kz=kz_pw), prm, g_sign)
-        fin_gl = final_kalman_run(alp, y, Fz, dict(init, Kz=Kz_glob), prm, g_sign)
-        d = fin_pw["g_ugal"] - fin_gl["g_ugal"]                # индекс 0 <-> цикл i_first
-        i0 = fin_gl["i_first"]
+        # эффект кусочного Kz на g
+        if DO_KZ_SEGMENTS:
+            n_seg_g = 14
+            seg = kz_segments(alp, y, Fz, t_all, init, prm, g_sign, n_seg_g, verbose=False)
+            if len(seg["Kz"]) == n_seg_g:
+                edges = np.linspace(0, n, n_seg_g + 1).astype(int)
+                kz_pw = np.repeat(seg["Kz"], np.diff(edges))
+                fin_pw = final_kalman_run(alp, y, Fz, dict(init, Kz=kz_pw), prm, g_sign)
+                fin_gl = final_kalman_run(alp, y, Fz, dict(init, Kz=Kz_glob), prm, g_sign)
+                d = fin_pw["g_ugal"] - fin_gl["g_ugal"]
+                i0 = fin_gl["i_first"]
+                db, gb = [], []
+                for a, b in zip(edges[:-1], edges[1:]):
+                    a_, b_ = max(a, i0) - i0, b - i0
+                    if b_ - a_ > 1000:
+                        db.append(d[a_:b_].mean())
+                        gb.append(fin_gl["g_ugal"][a_:b_].mean())
+                db, gb = np.array(db), np.array(gb)
+                noise_g = float(np.std(np.diff(gb)) / np.sqrt(2))
+                print(f"\nΔg (кусочный Kz − глобальный Kz = {Kz_glob:.4e}), {len(db)} сегментов:")
+                print(f"  std = {db.std():.3g}, p2p = {np.ptp(db):.3g} мкГал; "
+                      f"шум g в тех же сегментах ≈ {noise_g:.3g} мкГал; "
+                      f"std(Δg)/шум = {db.std() / noise_g:.2f}")
 
-        db, gb = [], []
-        for a, b in zip(edges[:-1], edges[1:]):
-            a_, b_ = max(a, i0) - i0, b - i0
-            if b_ - a_ > 1000:
-                db.append(d[a_:b_].mean())
-                gb.append(fin_gl["g_ugal"][a_:b_].mean())
-        db, gb = np.array(db), np.array(gb)
-        noise_g = float(np.std(np.diff(gb)) / np.sqrt(2))      # шум средних по сегменту
-        print(f"\nΔg (кусочный Kz − глобальный Kz = {Kz_glob:.4e}), {len(db)} сегментов:")
-        print(f"  std = {db.std():.3g}, p2p = {np.ptp(db):.3g} мкГал; "
-              f"шум g в тех же сегментах ≈ {noise_g:.3g} мкГал; "
-              f"std(Δg)/шум = {db.std() / noise_g:.2f}")
+        if DO_KZ_VEL:
+            x0v, P0v = kzv_start(x0, P0, KZV_SIGMA0)
+            lqv, Jv, lqsv, Jsv = tune_q_kzv(alp, y, Fz, x0v, P0v, init["q"],
+                                            init["sigma_A"], init["sigma_ph"], prm,
+                                            Q_KZV_LOG_BOUNDS)
+            fin5 = kzv_filter_run(alp, y, Fz, x0v, P0v, init["q"], 10.0 ** lqv,
+                                  init["sigma_A"], init["sigma_ph"], prm, g_sign)
+            cnt = n - prm.poi - prm.warmup
+            print(f"\n  Kz + скорость: log10 q_a = {lqv:.2f}, J = {fin5['J']:.5f}, "
+                  f"std(nu)={fin5['nu_std']:.3f}; "
+                  f"Δ(-2lnL) относительно фильтра без скорости = {cnt * (fin4['J'] - fin5['J']):+.1f} "
+                  f"(скорость оправдана, если заметно больше ~5)")
+            if min(lqv - Q_KZV_LOG_BOUNDS[0], Q_KZV_LOG_BOUNDS[1] - lqv) < 0.1:
+                print("  ВНИМАНИЕ: log10 q_a у границы Q_KZV_LOG_BOUNDS")
 
-    fin5 = None
-    if DO_KZ_VEL:
-        x0v, P0v = kzv_start(x0, P0, KZV_SIGMA0)
-        lqv, Jv, lqsv, Jsv = tune_q_kzv(alp, y, Fz, x0v, P0v, init["q"],
-                                        init["sigma_A"], init["sigma_ph"], prm,
-                                        Q_KZV_LOG_BOUNDS)
-        fin5 = kzv_filter_run(alp, y, Fz, x0v, P0v, init["q"], 10.0 ** lqv,
-                              init["sigma_A"], init["sigma_ph"], prm, g_sign)
-        cnt = n - prm.poi - prm.warmup
-        print(f"\n  Kz + скорость: log10 q_a = {lqv:.2f}, J = {fin5['J']:.5f}, "
-              f"std(nu)={fin5['nu_std']:.3f}; "
-              f"Δ(-2lnL) относительно фильтра без скорости = {cnt * (fin4['J'] - fin5['J']):+.1f} "
-              f"(скорость оправдана, если заметно больше ~5)")
-        if min(lqv - Q_KZV_LOG_BOUNDS[0], Q_KZV_LOG_BOUNDS[1] - lqv) < 0.1:
-            print("  ВНИМАНИЕ: log10 q_a у границы Q_KZV_LOG_BOUNDS")
-
-    i_first = fin4["i_first"]
-    t_k = t_all[i_first + np.arange(len(kz_t))]
+        t_k = t_all[i_first + np.arange(len(kz_t))]
 
     # ================= фринж по npts точкам (без фильтра) =================
     if FRINGE_KZ_MODE == "init":
@@ -2611,16 +2678,24 @@ def main():
     print(f"\nФринж по {npts} точкам (Kz: {FRINGE_KZ_MODE}): групп {fr['n_groups']}, "
           f"групп с полной лестницей: {np.mean(fr['n_distinct'] == npts):.1%}")
 
-    g3, g4, gf = fin3["g_ugal"], fin4["g_ugal"], fr["g_ugal"]
-    print(f"std g: EKF (Kz фикс.) {g3.std():.3g}, EKF (Kz в состоянии) {g4.std():.3g} мкГал (по циклам); "
-          f"фринж {gf.std():.3g} мкГал ({npts}-точечные группы)")
-    kalman_report(fin3, fin4, fin4s, fin5, Fz, prm, t_k)
+    g3, gf = fin3["g_ugal"], fr["g_ugal"]
+    msg = f"std g: EKF (Kz фикс.) {g3.std():.3g}"
+    if fin4 is not None:
+        msg += f", EKF (Kz в состоянии) {fin4['g_ugal'].std():.3g}"
+    print(msg + f" мкГал (по циклам); фринж {gf.std():.3g} мкГал ({npts}-точечные группы)")
+    if fin4 is not None:
+        kalman_report(fin3, fin4, fin4s, fin5, Fz, prm, t_k)
 
     # ================= девиация Аллана: EKF (Kz = const) против фринджа =================
     allan = None
     if DO_ALLAN:
-        Kz_mean = float(np.mean(kz_t[1000:]))        # средний Kz по треку фильтра
-        fin_c = final_kalman_run(alp, y, Fz, dict(init, Kz=Kz_mean), prm, g_sign)
+        if ALLAN_KZ_SRC == "init":
+            Kz_mean, src_txt = Kz0, "Kz0 по первым N_INIT точкам"
+            fin_c = fin3                                   # тот же прогон, пересчёт не нужен
+        else:
+            Kz_mean = float(np.mean(kz_t[1000:]))
+            src_txt = "среднее по треку фильтра"
+            fin_c = final_kalman_run(alp, y, Fz, dict(init, Kz=Kz_mean), prm, g_sign)
         fr_c = fringe_npoint(alp, y, Fz, Kz_mean, T, npts, fin_c["i_first"], n, g_sign)
 
         m_e, a_e, e_e = adev_in_cycles(fin_c["g_ugal"], 1)       # 1 отсчёт = 1 цикл
@@ -2628,7 +2703,7 @@ def main():
         S_e = white_noise_sensitivity(m_e, a_e, *ALLAN_FIT_M)
         S_f = white_noise_sensitivity(m_f, a_f, *ALLAN_FIT_M)
 
-        print(f"\nДевиация Аллана, Kz = {Kz_mean:.4e} (среднее по треку фильтра)")
+        print(f"\nДевиация Аллана, Kz = {Kz_mean:.4e} ({src_txt})")
         print(f"  чувствительность (m = {ALLAN_FIT_M[0]}..{ALLAN_FIT_M[1]}): "
               f"EKF {S_e:.3g}, фринж {S_f:.3g} мкГал/√цикл "
               f"({S_e * np.sqrt(t_cycle):.3g} и {S_f * np.sqrt(t_cycle):.3g} мкГал/√Гц)")
@@ -2654,7 +2729,6 @@ def main():
             n_jobs=N_JOBS, seed=SEED, tag=f"[{BRANCH}] ")
         print_summary(res_blocks, f"(чирп {BRANCH}) ")
 
-        # Kz фильтра, усреднённый по тем же блокам, против Kz блока
         filters = [("без скорости", kz_t)]
         if fin5 is not None:
             filters.append(("со скоростью", fin5["Kz"]))
@@ -2671,23 +2745,21 @@ def main():
                     print(f"  Kz фильтра {flab} (среднее по блоку) − Kz блока [{name}]: "
                           f"mean={d.mean():+.2e}, std={d.std(ddof=1):.2e}")
 
-
-    # ================= график: Kz(t) =================
+    # ================= графики =================
     if SHOW_PLOT:
         import matplotlib.pyplot as plt
-        kz0_label = f"Kz0 по первым {N_INIT} точкам = {Kz0:.4e}"
-        if res_blocks is not None:
-            plot_kz_compare(t_k, kz_t, fin4["sd_Kz"], res_blocks, BRANCH, Kz0,
-                            float(np.mean(t_all[:N_INIT])), kz0_label,
-                            kz_v=None if fin5 is None else fin5["Kz"],
-                            kz_s=None if fin4s is None else fin4s["Kz"])
-        else:
-            plot_kz_track(t_k, kz_t, fin4["sd_Kz"], Kz0, BRANCH, kz0_label,
-                          kz_s=None if fin4s is None else fin4s["Kz"])
-        
+        if DO_KZ_DYNAMICS:
+            kz0_label = f"Kz0 по первым {N_INIT} точкам = {Kz0:.4e}"
+            if res_blocks is not None:
+                plot_kz_compare(t_k, kz_t, fin4["sd_Kz"], res_blocks, BRANCH, Kz0,
+                                float(np.mean(t_all[:N_INIT])), kz0_label,
+                                kz_v=None if fin5 is None else fin5["Kz"],
+                                kz_s=None if fin4s is None else fin4s["Kz"])
+            else:
+                plot_kz_track(t_k, kz_t, fin4["sd_Kz"], Kz0, BRANCH, kz0_label,
+                              kz_s=None if fin4s is None else fin4s["Kz"])
         if allan is not None:
             plot_allan(allan, t_cycle, f"Девиация Аллана g, чирп {BRANCH}, Kz = const")
-        
         plt.show()
 
 if __name__ == "__main__":
