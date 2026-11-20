@@ -303,7 +303,7 @@ def sens_integral(delay, a):
     применяется к любой из трёх осей, разница только в K, которым
     результат домножается снаружи."""
     a = a[delay:delay + end]
-    return keff * np.trapz(fa_t*a, dx=t_step)
+    return keff * np.trapezoid(fa_t*a, dx=t_step)
 
 
 # ============================================================

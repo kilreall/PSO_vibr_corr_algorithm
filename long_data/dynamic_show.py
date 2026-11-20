@@ -2281,27 +2281,29 @@ def _adev_interp(m, adev, m_t):
     return float(np.exp(np.interp(np.log(m_t), np.log(m), np.log(adev))))
 
 
-def plot_allan(curves, t_cycle, title="Девиация Аллана g"):
+def plot_allan(curves, t_cycle, title="Девиация Аллана g", show_white=False):
     """
-    curves: список (подпись, (m, adev, err), S [мкГал/sqrt(цикл)], цвет, маркер).
-    Пунктир -- белый шум S/sqrt(m). Нижняя ось -- циклы, верхняя -- секунды.
+    curves: список (подпись, (m, adev, err), S, цвет, маркер).
+    Ось x -- время усреднения tau = m * t_cycle, с.
+    В легенде только названия кривых. show_white=True добавляет пунктиры
+    белого шума S/sqrt(m).
     """
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(9, 6))
     for lab, (m, adev, err), S, col, mk in curves:
-        ax.errorbar(m, adev, yerr=err, fmt=mk + "-", ms=4, lw=1, capsize=2, color=col,
-                    label=f"{lab}: {S:.3g} мкГал/√цикл ({S * np.sqrt(t_cycle):.3g} мкГал/√Гц)")
-        mm = np.array([m[0], m[-1]], dtype=float)
-        ax.plot(mm, S / np.sqrt(mm), ":", color=col, lw=1)
+        m = np.asarray(m, dtype=float)
+        ax.errorbar(m * t_cycle, adev, yerr=err, fmt=mk + "-", ms=4, lw=1,
+                    capsize=2, color=col, label=lab)
+        if show_white:
+            mm = np.array([m[0], m[-1]])
+            ax.plot(mm * t_cycle, S / np.sqrt(mm), ":", color=col, lw=1)
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("Число усредняемых циклов m")
+    ax.set_xlabel("Время усреднения τ, с")
     ax.set_ylabel("Девиация Аллана g, мкГал")
-    sec = ax.secondary_xaxis("top", functions=(lambda m: m * t_cycle, lambda s: s / t_cycle))
-    sec.set_xlabel("τ, с")
     ax.grid(alpha=0.3, which="both")
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=10)
     ax.set_title(title)
     fig.tight_layout()
 
@@ -2427,7 +2429,7 @@ def main():
     T = 12e-3                  # длительность плеча, с
 
     # ---------------- что считать ----------------
-    DO_KZ_DYNAMICS = False     # ГЛАВНЫЙ выключатель всего, что связано с динамикой Kz(t).
+    DO_KZ_DYNAMICS = True     # ГЛАВНЫЙ выключатель всего, что связано с динамикой Kz(t).
                                # False -> флаги DO_KZ_SEGMENTS/SMOOTH/VEL/BLOCKS ниже игнорируются
     DO_KZ_SEGMENTS = True      # Kz по сегментам (7/14/25) и эффект кусочного Kz на g
     DO_KZ_SMOOTH = True        # обратный проход RTS
@@ -2461,7 +2463,7 @@ def main():
     MAX_BLOCKS = None
     N_JOBS = None
     RECALIB_GLOBAL = True      # sigma и q по всему ряду (а не по первым N_INIT точкам)
-    Q_PH_MANUAL = 1e-5
+    Q_PH_MANUAL = None
 
     # ---------------- сравнение с фринджем / Аллан ----------------
     FRINGE_NPTS = 6
