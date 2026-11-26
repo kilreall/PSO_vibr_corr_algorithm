@@ -2413,6 +2413,16 @@ def q_ph_by_parts(alp, y, Fz, Kz, prm, tune_cfg, n_parts=4):
               f"sigma_ph = {info['sigma_ph']:.3e}, sigma_A = {info['sigma_A']:.3e}")
 
 
+def fringe_allan_case(alp, y, Fz, Kz, T, npts, i_first, n_total, g_sign, fit_m, name):
+    """
+    Ряд g по непересекающимся окнам из npts циклов (линейный фит фринджа в каждом
+    окне) и его девиация Аллана для одного Kz. Kz=0 -- «без коррекции».
+    """
+    fr = fringe_npoint(alp, y, Fz, Kz, T, npts, i_first, n_total, g_sign)
+    m, a, e = adev_in_cycles(fr["g_ugal"], npts)       # 1 отсчёт = npts циклов
+    return {"name": name, "Kz": Kz, "fr": fr, "m": m, "adev": a, "err": e,
+            "S": white_noise_sensitivity(m, a, *fit_m)}
+
 # =====================================================================
 # main
 # =====================================================================
@@ -2429,7 +2439,7 @@ def main():
     T = 12e-3                  # длительность плеча, с
 
     # ---------------- что считать ----------------
-    DO_KZ_DYNAMICS = True     # ГЛАВНЫЙ выключатель всего, что связано с динамикой Kz(t).
+    DO_KZ_DYNAMICS = False     # ГЛАВНЫЙ выключатель всего, что связано с динамикой Kz(t).
                                # False -> флаги DO_KZ_SEGMENTS/SMOOTH/VEL/BLOCKS ниже игнорируются
     DO_KZ_SEGMENTS = True      # Kz по сегментам (7/14/25) и эффект кусочного Kz на g
     DO_KZ_SMOOTH = True        # обратный проход RTS
@@ -2471,6 +2481,10 @@ def main():
     ALLAN_KZ_SRC = "init"      # Kz для Аллана: "init" -- Kz0;
                                # "track_mean" -- среднее по треку фильтра (требует DO_KZ_DYNAMICS)
     ALLAN_FIT_M = (6, 60)
+
+    ALLAN_COMPARE_NOCORR = True   # сравнить Аллан по окнам с коррекцией и без неё
+    ALLAN_NOCORR_KZ = 0.0         # Kz для «без коррекции»
+    ALLAN_SHOW_EKF = False        # добавить на график кривую EKF (с коррекцией)
 
     if BRANCH not in ("+", "-"):
         raise ValueError(f"BRANCH: '+' | '-', получено {BRANCH!r}")
@@ -2693,28 +2707,48 @@ def main():
     if DO_ALLAN:
         if ALLAN_KZ_SRC == "init":
             Kz_mean, src_txt = Kz0, "Kz0 по первым N_INIT точкам"
-            fin_c = fin3                                   # тот же прогон, пересчёт не нужен
         else:
             Kz_mean = float(np.mean(kz_t[1000:]))
             src_txt = "среднее по треку фильтра"
-            fin_c = final_kalman_run(alp, y, Fz, dict(init, Kz=Kz_mean), prm, g_sign)
-        fr_c = fringe_npoint(alp, y, Fz, Kz_mean, T, npts, fin_c["i_first"], n, g_sign)
 
-        m_e, a_e, e_e = adev_in_cycles(fin_c["g_ugal"], 1)       # 1 отсчёт = 1 цикл
-        m_f, a_f, e_f = adev_in_cycles(fr_c["g_ugal"], npts)     # 1 отсчёт = npts циклов
-        S_e = white_noise_sensitivity(m_e, a_e, *ALLAN_FIT_M)
-        S_f = white_noise_sensitivity(m_f, a_f, *ALLAN_FIT_M)
+        # оба случая: одни и те же окна (старт i_first, длина npts), меняется только Kz
+        cases = [fringe_allan_case(alp, y, Fz, Kz_mean, T, npts, i_first, n, g_sign,
+                                   ALLAN_FIT_M, "с коррекцией")]
+        if ALLAN_COMPARE_NOCORR:
+            cases.append(fringe_allan_case(alp, y, Fz, ALLAN_NOCORR_KZ, T, npts, i_first,
+                                           n, g_sign, ALLAN_FIT_M, "без коррекции"))
 
-        print(f"\nДевиация Аллана, Kz = {Kz_mean:.4e} ({src_txt})")
-        print(f"  чувствительность (m = {ALLAN_FIT_M[0]}..{ALLAN_FIT_M[1]}): "
-              f"EKF {S_e:.3g}, фринж {S_f:.3g} мкГал/√цикл "
-              f"({S_e * np.sqrt(t_cycle):.3g} и {S_f * np.sqrt(t_cycle):.3g} мкГал/√Гц)")
-        print("  m, циклов :   EKF, мкГал   фринж, мкГал   фринж/EKF")
-        for mt in (npts, 60, 600, 6000, 20000):
-            ae, af = _adev_interp(m_e, a_e, mt), _adev_interp(m_f, a_f, mt)
-            print(f"  {mt:9d} : {ae:11.3g} {af:14.3g} {af / ae:11.2f}")
-        allan = [("EKF (Kz = const)", (m_e, a_e, e_e), S_e, "tab:blue", "o"),
-                 (f"фринж по {npts} точкам", (m_f, a_f, e_f), S_f, "tab:red", "s")]
+        print(f"\nДевиация Аллана по непересекающимся окнам ({npts} точек), "
+              f"с коррекцией: Kz = {Kz_mean:.4e} ({src_txt})")
+        for c in cases:
+            print(f"  [{c['name']}, Kz={c['Kz']:.4e}] чувствительность "
+                  f"(m = {ALLAN_FIT_M[0]}..{ALLAN_FIT_M[1]}): {c['S']:.3g} мкГал/√цикл "
+                  f"({c['S'] * np.sqrt(t_cycle):.3g} мкГал/√Гц); "
+                  f"std g по окнам {c['fr']['g_ugal'].std():.3g} мкГал, "
+                  f"групп {c['fr']['n_groups']}")
+
+        mts = (npts, 60, 600, 6000, 20000)
+        print("\n  m, циклов | " + " | ".join(f"{c['name']:>14s}" for c in cases)
+              + (" | без/с" if len(cases) == 2 else ""))
+        for mt in mts:
+            v = [_adev_interp(c["m"], c["adev"], mt) for c in cases]
+            line = f"  {mt:9d} | " + " | ".join(f"{x:14.3g}" for x in v)
+            if len(cases) == 2:
+                line += f" | {v[1] / v[0]:5.2f}"
+            print(line)
+
+        palette = [("tab:red", "s"), ("tab:orange", "v")]
+        allan = [(f"фринж по {npts} точкам, {c['name']}", (c["m"], c["adev"], c["err"]),
+                  c["S"], col, mk) for c, (col, mk) in zip(cases, palette)]
+
+        if ALLAN_SHOW_EKF:
+            if ALLAN_KZ_SRC == "init":
+                fin_c = fin3
+            else:
+                fin_c = final_kalman_run(alp, y, Fz, dict(init, Kz=Kz_mean), prm, g_sign)
+            m_e, a_e, e_e = adev_in_cycles(fin_c["g_ugal"], 1)
+            S_e = white_noise_sensitivity(m_e, a_e, *ALLAN_FIT_M)
+            allan.insert(0, ("EKF, с коррекцией", (m_e, a_e, e_e), S_e, "tab:blue", "o"))
 
     # ================= Kz по блокам (прежний метод) =================
     res_blocks = None
